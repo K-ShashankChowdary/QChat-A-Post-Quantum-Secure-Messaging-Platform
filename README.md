@@ -3,9 +3,11 @@
 QChat is a next-generation End-to-End Encrypted (E2EE) messaging platform built to resist the "Harvest Now, Decrypt Later" threat of quantum computing. It implements a Zero-Knowledge backend architecture and a highly optimized Hybrid Cryptographic strategy.
 
 ## 🛠 Technology Stack
-- **Frontend**: React (Vite), Socket.io-client, `@noble/post-quantum`.
+- **Frontend**: React (Vite), Socket.io-client, `@noble/post-quantum`, Framer Motion.
 - **Backend**: Node.js, Express, Socket.io, MongoDB (Mongoose).
 - **Cryptography**: ML-KEM-768, AES-256-GCM, SHA-256.
+- **Real-Time Media**: WebRTC peer-to-peer video calling, with signaling encrypted per-message via ML-KEM/AES-256-GCM.
+- **Messaging Features**: image/audio/file attachments, voice notes, reply threading, emoji reactions, delete-for-everyone, online/last-seen presence.
 
 ---
 
@@ -100,69 +102,86 @@ When Alice sends "Hello" to Bob, Bob's 1184-byte Public Key is fetched to encaps
 
 ```javascript
 export async function encryptMessage(text, recipientPublicKey) {
-  // 1. ML-KEM Encapsulation (Generates 1088-byte lattice ciphertext & 32-byte secret)
-  const { sharedSecret, cipherText: encapsulatedKey } = ml_kem768.encapsulate(recipientPublicKey);
+  if (!text) throw new Error('EMPTY_MESSAGE');
+  if (!recipientPublicKey || recipientPublicKey.byteLength !== 1184) {
+    throw new Error(`INVALID_PUBLIC_KEY: expected 1184 bytes, got ${recipientPublicKey?.byteLength}`);
+  }
 
-  // 2. Key Derivation (Hash lattice secret to raw AES symmetric key)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', sharedSecret);
-  const aesKey = await crypto.subtle.importKey('raw', hashBuffer, { name: 'AES-GCM' }, false, ['encrypt']);
+  try {
+    // 1. ML-KEM Encapsulation (Generates 1088-byte lattice ciphertext & 32-byte secret)
+    const { sharedSecret, cipherText: encapsulatedKey } = ml_kem768.encapsulate(recipientPublicKey);
 
-  // 3. AES-256-GCM Symmetric Fast-Encryption
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encodedText = new TextEncoder().encode(text);
-  
-  const encryptedBuffer = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv }, 
-    aesKey, 
-    encodedText
-  );
+    // 2. Key Derivation (Hash lattice secret to raw AES symmetric key)
+    const aesKey = await deriveAESKey(sharedSecret);
 
-  // Buffer automatically contains [Ciphertext... + 16-byte AuthTag MAC]
-  const encryptedArray = new Uint8Array(encryptedBuffer);
-  const ciphertext = encryptedArray.slice(0, -16);
-  const authTag = encryptedArray.slice(-16);
+    // 3. AES-256-GCM Symmetric Fast-Encryption
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encodedData = new TextEncoder().encode(text);
 
-  // 4. Return as JSON mapping logic
-  return {
-    encapsulatedKey: b64encode(encapsulatedKey),
-    nonce: b64encode(iv),
-    ciphertext: b64encode(ciphertext),
-    authTag: b64encode(authTag),
-  };
+    const encryptedBuffer = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      aesKey,
+      encodedData
+    );
+
+    // Buffer automatically contains [Ciphertext... + 16-byte AuthTag MAC]
+    const encryptedArray = new Uint8Array(encryptedBuffer);
+    const ciphertext = encryptedArray.slice(0, -16);
+    const authTag = encryptedArray.slice(-16);
+
+    // 4. Return as JSON mapping logic (also used verbatim for attachments/WebRTC signaling)
+    return {
+      encapsulatedKey: b64encode(encapsulatedKey),
+      nonce: b64encode(iv),
+      ciphertext: b64encode(ciphertext),
+      authTag: b64encode(authTag),
+      timestamp: Date.now()
+    };
+  } catch (error) {
+    throw new Error('ENCRYPTION_FAILED');
+  }
 }
 ```
+`text` is not limited to chat text — attachments (base64-encoded images/audio/files) and WebRTC signaling payloads (`JSON.stringify`'d SDP/ICE data) are passed through this exact same function. See Section 5 and 6 below.
 
 The 16-byte `authTag` is a MAC (Message Authentication Code). If the server tries to flip a single bit of the ciphertext stream, the Native Web Crypto subsystem instantly invalidates decoding to prevent tamper attacks.
 
 ### 2.4 Code Implementation: Decrypting the Transmission
 When Bob's socket receives the payload, the sequence is inverted:
 ```javascript
-export async function decryptMessage(encryptedPayload, myPrivateKey) {
-  // 1. Lattice Decapsulation using Vaulted Secret Key
-  const encKeyArray = b64decode(encryptedPayload.encapsulatedKey);
-  const sharedSecret = ml_kem768.decapsulate(encKeyArray, myPrivateKey);
+export async function decryptMessage(payload, myPrivateKey) {
+  if (!payload || !payload.encapsulatedKey || !payload.nonce || !payload.ciphertext || !payload.authTag) {
+    throw new Error('INVALID_PAYLOAD_STRUCTURE');
+  }
 
-  // 2. Map Shared Secret back to identical AES Key
-  const hashBuffer = await crypto.subtle.digest('SHA-256', sharedSecret);
-  const aesKey = await crypto.subtle.importKey('raw', hashBuffer, { name: 'AES-GCM' }, false, ['decrypt']);
+  try {
+    // 1. Lattice Decapsulation using Vaulted Secret Key
+    const encapKey = b64decode(payload.encapsulatedKey);
+    const sharedSecret = ml_kem768.decapsulate(encapKey, myPrivateKey);
 
-  // 3. Build Authentication Block
-  const ivBuffer = b64decode(encryptedPayload.nonce);
-  const cipherBuffer = b64decode(encryptedPayload.ciphertext);
-  const authTagBuffer = b64decode(encryptedPayload.authTag);
-  
-  const combinedBuffer = new Uint8Array(cipherBuffer.length + authTagBuffer.length);
-  combinedBuffer.set(cipherBuffer);
-  combinedBuffer.set(authTagBuffer, cipherBuffer.length);
+    // 2. Map Shared Secret back to identical AES Key
+    const aesKey = await deriveAESKey(sharedSecret);
 
-  // 4. Unlock
-  const decryptedBuffer = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: ivBuffer },
-    aesKey,
-    combinedBuffer
-  );
+    // 3. Build Authentication Block
+    const iv = b64decode(payload.nonce);
+    const ciphertext = b64decode(payload.ciphertext);
+    const authTag = b64decode(payload.authTag);
 
-  return new TextDecoder().decode(decryptedBuffer);
+    const combined = new Uint8Array(ciphertext.length + authTag.length);
+    combined.set(ciphertext);
+    combined.set(authTag, ciphertext.length);
+
+    // 4. Unlock
+    const decryptedBuffer = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      aesKey,
+      combined
+    );
+
+    return new TextDecoder().decode(decryptedBuffer);
+  } catch (error) {
+    throw new Error('DECRYPTION_FAILED');
+  }
 }
 ```
 
@@ -215,27 +234,72 @@ messageSchema.index({ from_user_id: 1, to_user_id: 1, timestamp: -1 });
 To prevent the Zero-Knowledge backend from arbitrarily destroying chat sequences or executing selective-deletion assaults, QChat implements a block-synchronization hash string mathematically mirroring blockchain technology.
 
 #### Hash Formalism
-$H_n = \text{SHA256}_{digest}(H_{n-1} + \text{Text}_n + \text{Timestamp}_n)$
+$H_n = \text{SHA256}_{digest}(H_{n-1} + \text{Text}_n + \text{Timestamp}_n + \text{Direction}_n)$
 
 #### Execution Snippet
 ```javascript
 export async function calculateIntegrity(messages) {
+  if (!messages || messages.length === 0) return '0x0000...';
+
   let currentHash = new Uint8Array(32); // Seed
 
   for (const msg of messages) {
-    const data = new TextEncoder().encode(msg.text + msg.timestamp);
-    
+    // Direction (in/out) is folded into the hash so a message can't be
+    // silently reattributed to the other party without changing the chain.
+    const direction = msg.isMine ? 'out' : 'in';
+    const data = new TextEncoder().encode(msg.text + msg.timestamp + direction);
+
     // Concat previous hash recursively to the current payload data
     const combined = new Uint8Array(currentHash.length + data.length);
     combined.set(currentHash);
     combined.set(data, currentHash.length);
-    
+
     // Hash the recursive array outputting a cascading checksum
     const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-    currentHash = new Uint8Array(hashBuffer); 
+    currentHash = new Uint8Array(hashBuffer);
   }
 
   return b64encode(currentHash).slice(0, 16) + '...';
 }
 ```
+> **Note:** this is a linear hash chain (each message folds into one running hash), not yet a branching Merkle tree with independently-verifiable left/right subtrees as described conceptually above. Tracked in `improve.txt` → `FEAT-3`.
 If a database administrator shifts the `timestamp` or `payload` of arbitrary Message number 5, the microscopic data corruption heavily magnifies the ensuing hash derivatives across `combined.set(currentHash)`, instantly voiding the UI integrity string mapping at Message 50.
+
+
+## 5. Secure Real-Time Communication (WebRTC Video Calling)
+*File: `frontend/src/components/ChatDashboard.jsx`*
+
+QChat extends its hybrid encryption model to peer-to-peer video calling. WebRTC handles the actual audio/video transport, but every piece of *signaling* — SDP offers, answers, and ICE candidates — is individually wrapped through the same `encryptMessage`/`decryptMessage` pipeline used for chat messages before it ever touches the Socket.io relay:
+
+```javascript
+const encryptAndSendSignal = async (signalData, toId) => {
+  const recipientPubKey = b64decode(peerRef.current.public_key);
+  const payload = await encryptMessage(JSON.stringify(signalData), recipientPubKey);
+  socketRef.current?.emit('webrtc_signal', { toId, fromId: currentUser.id, signalPayload: payload });
+};
+```
+
+The signaling server (`backend/server.js`) only ever relays an opaque encrypted blob between two socket IDs — it never sees an SDP offer, an ICE candidate, or the resulting media stream in plaintext:
+
+```javascript
+socket.on('webrtc_signal', ({ toId, fromId, signalPayload }) => {
+  const toSocket = onlineUsers.get(String(toId));
+  if (toSocket) io.to(toSocket).emit('webrtc_signal', { fromId, signalPayload });
+});
+```
+
+Once both sides exchange an encrypted offer/answer and ICE candidates, `RTCPeerConnection` establishes a direct peer-to-peer media path. Call state (`idle → calling/receiving → connected`) is tracked client-side; hanging up sends an encrypted `end_call` signal so both peers tear down cleanly.
+
+> **Known limitation:** the current ICE configuration only lists a public STUN server. Calls across symmetric NATs or restrictive firewalls may fail to connect without a TURN server. Tracked in `improve.txt` → `OPS-3`.
+
+## 6. Messaging Features (Attachments, Replies, Reactions, Delete, Presence)
+
+Beyond text, QChat's chat surface supports the messaging primitives users expect from a modern app — all still routed through the same end-to-end encryption pipeline as plain text:
+
+- **Attachments** — images, voice notes, and files are read client-side as base64 (`FileReader`/`MediaRecorder`), then encrypted exactly like a text message (`encryptMessage(base64Data, recipientPublicKey)`). Capped at 2MB client-side for the MVP.
+- **Reply threading** — replies carry a `reply_to_id` pointing at the original message; the UI renders an inline quote and scrolls to the original on click.
+- **Emoji reactions** — reactions are pushed to the `Message.reactions` array and synced live over `message_reaction` socket events to both sender and recipient.
+- **Delete for everyone** — deleting a message is a soft delete: the server clears `payload`/`sender_payload` and sets `deleted: true`; clients render a tombstone rather than removing the message outright.
+- **Presence** — `User.is_online` and `User.last_seen` are updated on socket connect/disconnect and broadcast via `user_status`, driving the online dot and "Last seen …" text in the UI.
+
+> **Known limitations:** reactions aren't currently deduplicated per user, and attachments are stored inline rather than in dedicated blob storage. Tracked in `improve.txt` → `BUG-1` and `OPS-4`.
