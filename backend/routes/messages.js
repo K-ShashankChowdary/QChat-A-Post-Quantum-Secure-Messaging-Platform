@@ -33,7 +33,13 @@ router.get('/:peerId', authenticateToken, async (req, res) => {
       toId:           msg.to_user_id,
       payload:        msg.payload,
       senderPayload:  msg.sender_payload,
-      timestamp:      msg.timestamp
+      timestamp:      msg.timestamp,
+      delivered:      msg.delivered,
+      read:           msg.read,
+      replyToId:      msg.reply_to_id,
+      deleted:        msg.deleted,
+      type:           msg.type,
+      reactions:      msg.reactions
     })));
   } catch (error) {
     logger.error('Fetch history failed', { message: error.message }, CTX);
@@ -57,6 +63,16 @@ router.delete('/:peerId', authenticateToken, async (req, res) => {
     });
 
     logger.info(`Cleared ${result.deletedCount} messages`, { peerId }, CTX);
+
+    // Notify the peer if they are online so their UI syncs
+    if (req.io && req.onlineUsers) {
+      const peerSocketId = req.onlineUsers.get(String(peerId));
+      if (peerSocketId) {
+        req.io.to(peerSocketId).emit('chat_cleared', { byUserId: currentUserId });
+        logger.info(`Emitted chat_cleared to peer`, { peerId, socketId: peerSocketId }, CTX);
+      }
+    }
+
     res.json({ deleted: result.deletedCount });
   } catch (error) {
     logger.error('Clear conversation failed', { message: error.message }, CTX);

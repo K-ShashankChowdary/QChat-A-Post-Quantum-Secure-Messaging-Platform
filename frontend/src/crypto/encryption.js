@@ -1,83 +1,80 @@
 import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
 
-/**
- * Generates an ML-KEM-768 keypair.
- * Returns { publicKey: Uint8Array, privateKey: Uint8Array }
- */
+// Generates ML-KEM-768 keys and returns public/private Uint8Arrays
 export async function generateKeyPair() {
-  const keys = ml_kem768.keygen();
-  return {
-    publicKey: keys.publicKey,
-    privateKey: keys.secretKey
-  };
+  try {
+    const keys = ml_kem768.keygen();
+    return {
+      publicKey: keys.publicKey,
+      privateKey: keys.secretKey
+    };
+  } catch (error) {
+    console.error('Key generation failed:', error);
+    throw new Error('KEYGEN_FAILED');
+  }
 }
 
-/**
- * Derives a 256-bit AES key from a shared secret using SHA-256.
- */
+// Hashes the shared secret and imports it as a raw 256-bit AES-GCM key
 async function deriveAESKey(sharedSecret) {
-  const hash = await crypto.subtle.digest('SHA-256', sharedSecret);
-  return crypto.subtle.importKey(
-    'raw',
-    hash,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
+  try {
+    const hash = await crypto.subtle.digest('SHA-256', sharedSecret);
+    return await crypto.subtle.importKey(
+      'raw',
+      hash,
+      { name: 'AES-GCM' },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  } catch (error) {
+    console.error('Failed to derive AES key:', error);
+    throw new Error('KEY_DERIVATION_FAILED');
+  }
 }
 
-/**
- * Encrypts a message using ML-KEM + AES-256-GCM hybrid encryption.
- * @param {string} text - The plaintext message
- * @param {Uint8Array} recipientPublicKey - The recipient's ML-KEM public key
- * @returns {Promise<Object>} - Encrypted payload structure
- */
+// Wraps a message in ML-KEM + AES-256-GCM hybrid encryption
 export async function encryptMessage(text, recipientPublicKey) {
   if (!text) throw new Error('EMPTY_MESSAGE');
   if (!recipientPublicKey || recipientPublicKey.byteLength !== 1184) {
     throw new Error(`INVALID_PUBLIC_KEY: expected 1184 bytes, got ${recipientPublicKey?.byteLength}`);
   }
 
-  // 1. ML-KEM Encapsulation
-  const { sharedSecret, cipherText: encapsulatedKey } = ml_kem768.encapsulate(recipientPublicKey);
+  try {
+    // Encapsulate against recipient public key to generate the shared secret
+    const { sharedSecret, cipherText: encapsulatedKey } = ml_kem768.encapsulate(recipientPublicKey);
 
-  // 2. Derive AES key from shared secret
-  const aesKey = await deriveAESKey(sharedSecret);
+    // Swap the shared secret for an AES key
+    const aesKey = await deriveAESKey(sharedSecret);
 
-  // 3. Encrypt data with AES-GCM
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoder = new TextEncoder();
-  const encodedData = encoder.encode(text);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoder = new TextEncoder();
+    const encodedData = encoder.encode(text);
 
-  const encryptedBuffer = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    encodedData
-  );
+    // Encrypt the payload
+    const encryptedBuffer = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      aesKey,
+      encodedData
+    );
 
-  // Buffer contains [ciphertext... , authTag (16 bytes)]
-  const encryptedArray = new Uint8Array(encryptedBuffer);
-  const ciphertext = encryptedArray.slice(0, -16);
-  const authTag = encryptedArray.slice(-16);
+    // AES-GCM appends a 16-byte auth tag at the end of the ciphertext buffer. Need to split them.
+    const encryptedArray = new Uint8Array(encryptedBuffer);
+    const ciphertext = encryptedArray.slice(0, -16);
+    const authTag = encryptedArray.slice(-16);
 
-  return {
-    encapsulatedKey: b64encode(encapsulatedKey),
-    nonce: b64encode(iv),
-    ciphertext: b64encode(ciphertext),
-    authTag: b64encode(authTag),
-    timestamp: Date.now()
-  };
+    return {
+      encapsulatedKey: b64encode(encapsulatedKey),
+      nonce: b64encode(iv),
+      ciphertext: b64encode(ciphertext),
+      authTag: b64encode(authTag),
+      timestamp: Date.now()
+    };
+  } catch (error) {
+    console.error('Encryption failed:', error);
+    throw new Error('ENCRYPTION_FAILED');
+  }
 }
 
-/**
- * Decrypts a message using ML-KEM + AES-256-GCM hybrid encryption.
- * Validates the payload structure and decapsulates the ML-KEM shared secret,
- * then derives the AES key to decrypt the payload.
- * 
- * @param {Object} payload - The encrypted payload { encapsulatedKey, nonce, ciphertext, authTag }
- * @param {Uint8Array} myPrivateKey - My private ML-KEM key (2400 bytes for ML-KEM-768)
- * @returns {Promise<string>} - The decrypted plaintext
- */
+// Decrypts payload by decapsulating the shared secret and unwrapping the AES cipher
 export async function decryptMessage(payload, myPrivateKey) {
   if (!payload || !payload.encapsulatedKey || !payload.nonce || !payload.ciphertext || !payload.authTag) {
     throw new Error('INVALID_PAYLOAD_STRUCTURE');
@@ -89,14 +86,13 @@ export async function decryptMessage(payload, myPrivateKey) {
     const ciphertext = b64decode(payload.ciphertext);
     const authTag = b64decode(payload.authTag);
 
-    // 1. ML-KEM Decapsulation
+    // Decapsulate the shared secret using our private key
     const sharedSecret = ml_kem768.decapsulate(encapKey, myPrivateKey);
 
-    // 2. Derive AES key from shared secret
+    // Rebuild the AES key
     const aesKey = await deriveAESKey(sharedSecret);
 
-    // 3. Decrypt data with AES-GCM
-    // SubtleCrypto expects [ciphertext, authTag] concatenated
+    // WebCrypto AES-GCM expects the ciphertext and auth tag to be a single concatenated buffer
     const combined = new Uint8Array(ciphertext.length + authTag.length);
     combined.set(ciphertext);
     combined.set(authTag, ciphertext.length);
@@ -114,43 +110,46 @@ export async function decryptMessage(payload, myPrivateKey) {
   }
 }
 
-/**
- * Calculates a basic Merkle Root (Hash Chain) for a conversation.
- * @param {Array} messages - List of decrypted message objects
- * @returns {Promise<string>} - The conversation integrity hash
- */
+// Builds a rolling SHA-256 hash chain of the conversation history
 export async function calculateIntegrity(messages) {
-  if (messages.length === 0) return '0x0000...';
+  if (!messages || messages.length === 0) return '0x0000...';
   
-  let currentHash = new Uint8Array(32); // Initial seed
-  const encoder = new TextEncoder();
+  try {
+    let currentHash = new Uint8Array(32);
+    const encoder = new TextEncoder();
 
-  for (const msg of messages) {
-    const data = encoder.encode(msg.text + msg.timestamp);
-    const combined = new Uint8Array(currentHash.length + data.length);
-    combined.set(currentHash);
-    combined.set(data, currentHash.length);
-    
-    const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-    currentHash = new Uint8Array(hashBuffer);
+    for (const msg of messages) {
+      // Concat previous hash with current message data (including direction)
+      const direction = msg.isMine ? 'out' : 'in';
+      const data = encoder.encode(msg.text + msg.timestamp + direction);
+      const combined = new Uint8Array(currentHash.length + data.length);
+      combined.set(currentHash);
+      combined.set(data, currentHash.length);
+      
+      const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
+      currentHash = new Uint8Array(hashBuffer);
+    }
+
+    return b64encode(currentHash).slice(0, 16) + '...';
+  } catch (error) {
+    console.error('Integrity check failed:', error);
+    throw new Error('INTEGRITY_CALCULATION_FAILED');
   }
-
-  return b64encode(currentHash).slice(0, 16) + '...';
 }
 
-// Helpers for Base64 coding
+// Convert Uint8Array to Base64 using chunking to prevent max call stack limits and memory bloat
 export function b64encode(uint8) {
+  const chunkSize = 8192;
   let binary = '';
-  const len = uint8.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(uint8[i]);
+  for (let i = 0; i < uint8.byteLength; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, uint8.subarray(i, i + chunkSize));
   }
   return btoa(binary);
 }
 
+// Convert Base64 back to Uint8Array
 export function b64decode(b64) {
   if (typeof b64 !== 'string') return new Uint8Array();
-  // Decode base64 to a raw binary string, then convert to Uint8Array
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) {

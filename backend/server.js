@@ -33,6 +33,14 @@ app.use(morgan((tokens, req, res) => {
 app.use(cors());
 app.use(express.json());
 
+// ── Expose Socket.io to routes ──
+const onlineUsers = new Map(); // userId → socketId
+app.use((req, res, next) => {
+  req.io = io;
+  req.onlineUsers = onlineUsers;
+  next();
+});
+
 // ── Routes ──
 app.use('/api/auth',     authRoutes);
 app.use('/api/messages', messageRoutes);
@@ -40,8 +48,8 @@ app.use('/api/messages', messageRoutes);
 // ── Users endpoint ──
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
-    const users = await User.find({ _id: { $ne: req.user.id } }).select('username public_key');
-    const formatted = users.map(u => ({ id: u._id, username: u.username, public_key: u.public_key }));
+    const users = await User.find({ _id: { $ne: req.user.id } }).select('username public_key last_seen is_online');
+    const formatted = users.map(u => ({ id: u._id, username: u.username, public_key: u.public_key, lastSeen: u.last_seen, isOnline: u.is_online }));
     logger.info(`Users listed`, { count: formatted.length, requestor: req.user.username }, 'Users');
     res.json(formatted);
   } catch (error) {
@@ -51,7 +59,6 @@ app.get('/api/users', authenticateToken, async (req, res) => {
 });
 
 // ── Socket.io ──
-const onlineUsers = new Map(); // userId → socketId
 
 io.on('connection', (socket) => {
   logger.event(`Socket connected`, { socketId: socket.id }, 'Socket');
@@ -60,7 +67,9 @@ io.on('connection', (socket) => {
     socket.userId = String(userId); // store for O(1) disconnect cleanup
     onlineUsers.set(String(userId), socket.id);
     logger.event('User registered socket', { userId, socketId: socket.id, online: onlineUsers.size }, 'Socket');
-    io.emit('user_status', { userId, status: 'online' });
+    
+    await User.findByIdAndUpdate(userId, { is_online: true, last_seen: new Date() });
+    io.emit('user_status', { userId, status: 'online', lastSeen: new Date() });
 
     // ── Deliver any messages that arrived while this user was offline ──
     try {
@@ -76,7 +85,11 @@ io.on('connection', (socket) => {
             id:       msg._id,
             fromId:   msg.from_user_id,
             payload:  msg.payload,
-            timestamp: msg.timestamp
+            timestamp: msg.timestamp,
+            type:      msg.type,
+            replyToId: msg.reply_to_id,
+            deleted:   msg.deleted,
+            reactions: msg.reactions
           });
         }
         // Mark all as delivered
@@ -84,13 +97,23 @@ io.on('connection', (socket) => {
           { _id: { $in: pending.map(m => m._id) } },
           { $set: { delivered: true } }
         );
+
+        // Notify senders that their messages were delivered
+        const senderIds = [...new Set(pending.map(m => String(m.from_user_id)))];
+        for (const sId of senderIds) {
+          const sSocket = onlineUsers.get(sId);
+          if (sSocket) {
+            const deliveredIds = pending.filter(m => String(m.from_user_id) === sId).map(m => m._id);
+            io.to(sSocket).emit('message_delivered', { messageIds: deliveredIds, toUserId: userId });
+          }
+        }
       }
     } catch (err) {
       logger.error('Offline delivery failed', { message: err.message }, 'Socket');
     }
   });
 
-  socket.on('send_message', async ({ toId, fromId, payload, senderPayload }) => {
+  socket.on('send_message', async ({ toId, fromId, payload, senderPayload, type, replyToId }) => {
     logger.event('Relay message', { fromId, toId }, 'Socket');
     try {
       // Check if recipient is currently connected
@@ -102,6 +125,8 @@ io.on('connection', (socket) => {
         to_user_id:     toId,
         payload,
         sender_payload: senderPayload || null,
+        type:           type || 'text',
+        reply_to_id:    replyToId || null,
         delivered:      !!toSocket 
       });
       await msg.save();
@@ -109,9 +134,12 @@ io.on('connection', (socket) => {
 
       if (toSocket) {
         io.to(toSocket).emit('new_message', {
-          id: msg._id, fromId, payload, timestamp: msg.timestamp
+          id: msg._id, fromId, payload, timestamp: msg.timestamp,
+          type: msg.type, replyToId: msg.reply_to_id, deleted: msg.deleted, reactions: msg.reactions
         });
         logger.event('Message delivered', { toId, socketId: toSocket }, 'Socket');
+        // Notify sender it was delivered immediately
+        socket.emit('message_delivered', { messageIds: [msg._id], toUserId: toId });
       } else {
         logger.warn('Recipient offline — message persisted for delivery on reconnect', { toId }, 'Socket');
       }
@@ -120,13 +148,82 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('disconnect', (reason) => {
+  socket.on('webrtc_signal', ({ toId, fromId, signalPayload }) => {
+    logger.event('Relay WebRTC signal', { fromId, toId }, 'Socket');
+    const toSocket = onlineUsers.get(String(toId));
+    if (toSocket) {
+      io.to(toSocket).emit('webrtc_signal', { fromId, signalPayload });
+    }
+  });
+
+  socket.on('typing', ({ toId, fromId }) => {
+    const toSocket = onlineUsers.get(String(toId));
+    if (toSocket) io.to(toSocket).emit('typing', { fromId });
+  });
+
+  socket.on('stop_typing', ({ toId, fromId }) => {
+    const toSocket = onlineUsers.get(String(toId));
+    if (toSocket) io.to(toSocket).emit('stop_typing', { fromId });
+  });
+
+  socket.on('message_read', async ({ messageIds, fromId, toId }) => {
+    try {
+      await Message.updateMany(
+        { _id: { $in: messageIds } },
+        { $set: { read: true } }
+      );
+      const toSocket = onlineUsers.get(String(toId));
+      if (toSocket) {
+        io.to(toSocket).emit('message_read', { messageIds, byUserId: fromId });
+      }
+    } catch (err) {
+      logger.error('Failed to update message read status', { message: err.message }, 'Socket');
+    }
+  });
+
+  socket.on('delete_message', async ({ messageId, fromId, toId }) => {
+    try {
+      await Message.findOneAndUpdate(
+        { _id: messageId, from_user_id: fromId },
+        { $set: { deleted: true, payload: {}, sender_payload: {} } }
+      );
+      const toSocket = onlineUsers.get(String(toId));
+      if (toSocket) io.to(toSocket).emit('message_deleted', { messageId });
+      
+      const senderSocket = onlineUsers.get(String(fromId));
+      if (senderSocket) io.to(senderSocket).emit('message_deleted', { messageId });
+    } catch (err) {
+      logger.error('Failed to delete message', { message: err.message }, 'Socket');
+    }
+  });
+
+  socket.on('message_reaction', async ({ messageId, emoji, fromId, toId }) => {
+    try {
+      await Message.updateOne(
+        { _id: messageId },
+        { $push: { reactions: { emoji, user_id: fromId } } }
+      );
+      const payload = { messageId, reaction: { emoji, user_id: fromId } };
+      const toSocket = onlineUsers.get(String(toId));
+      if (toSocket) io.to(toSocket).emit('message_reaction', payload);
+      
+      const senderSocket = onlineUsers.get(String(fromId));
+      if (senderSocket) io.to(senderSocket).emit('message_reaction', payload);
+    } catch (err) {
+      logger.error('Failed to add reaction', { message: err.message }, 'Socket');
+    }
+  });
+
+  socket.on('disconnect', async (reason) => {
     if (socket.userId) {
       if (onlineUsers.get(socket.userId) === socket.id) {
         onlineUsers.delete(socket.userId);
       }
       logger.event('User disconnected', { userId: socket.userId, reason, remaining: onlineUsers.size }, 'Socket');
-      io.emit('user_status', { userId: socket.userId, status: 'offline' });
+      
+      const lastSeen = new Date();
+      await User.findByIdAndUpdate(socket.userId, { is_online: false, last_seen: lastSeen });
+      io.emit('user_status', { userId: socket.userId, status: 'offline', lastSeen });
     }
   });
 

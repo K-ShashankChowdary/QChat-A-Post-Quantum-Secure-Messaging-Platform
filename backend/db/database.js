@@ -25,7 +25,9 @@ const userSchema = new mongoose.Schema({
   username:      { type: String, required: true, unique: true },
   password_hash: { type: String, required: true },
   public_key:    { type: String },
-  created_at:    { type: Date, default: Date.now }
+  created_at:    { type: Date, default: Date.now },
+  last_seen:     { type: Date, default: Date.now },
+  is_online:     { type: Boolean, default: false }
 });
 
 export const User = mongoose.model('User', userSchema);
@@ -37,7 +39,15 @@ const messageSchema = new mongoose.Schema({
   payload:        { type: Object, required: true },           // encrypted for recipient
   sender_payload: { type: Object, default: null },           // encrypted for sender (so they can read their own messages)
   timestamp:      { type: Date, default: Date.now, index: true },
-  delivered:      { type: Boolean, default: false }
+  delivered:      { type: Boolean, default: false },
+  read:           { type: Boolean, default: false },
+  reply_to_id:    { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null },
+  deleted:        { type: Boolean, default: false },
+  type:           { type: String, default: 'text', enum: ['text', 'image', 'audio', 'file'] },
+  reactions:      [{ 
+    emoji: { type: String },
+    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  }]
 });
 
 messageSchema.index({ from_user_id: 1, to_user_id: 1, timestamp: -1 });
