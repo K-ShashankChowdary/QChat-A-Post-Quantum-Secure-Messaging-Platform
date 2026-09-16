@@ -24,17 +24,32 @@ router.get('/:peerId', authenticateToken, async (req, res) => {
   const limit = Math.min(Number.isNaN(parsedLimit) ? DEFAULT_PAGE_SIZE : Math.max(parsedLimit, 1), MAX_PAGE_SIZE);
   const offset = Number.isNaN(parsedOffset) ? 0 : Math.max(parsedOffset, 0);
 
-  logger.info('Fetch history', { currentUserId, peerId, limit, offset }, CTX);
+  // Paging backwards by offset skews when live messages arrive mid-scroll (they
+  // shift the window and a page gets skipped), so prefer a timestamp cursor and
+  // keep offset only as a fallback.
+  const filter = {
+    $or: [
+      { from_user_id: currentUserId, to_user_id: peerId },
+      { from_user_id: peerId, to_user_id: currentUserId },
+    ],
+  };
+
+  let before = null;
+  if (req.query.before) {
+    const parsed = new Date(req.query.before);
+    if (Number.isNaN(parsed.getTime())) {
+      return res.status(400).json({ error: 'Invalid "before" cursor' });
+    }
+    before = parsed;
+    filter.timestamp = { $lt: parsed };
+  }
+
+  logger.info('Fetch history', { currentUserId, peerId, limit, offset, before }, CTX);
 
   try {
-    const messages = await Message.find({
-      $or: [
-        { from_user_id: currentUserId, to_user_id: peerId },
-        { from_user_id: peerId, to_user_id: currentUserId },
-      ],
-    })
+    const messages = await Message.find(filter)
       .sort({ timestamp: -1 })
-      .skip(offset)
+      .skip(before ? 0 : offset)
       .limit(limit);
 
     // Re-order messages back to chronological order

@@ -33,6 +33,31 @@ const formatLastSeen = ts => {
 
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢'];
 
+// How many messages to pull per page of history.
+const PAGE_SIZE = 50;
+
+/* ─── ICE / TURN ───
+   STUN only tells a peer its public address; it cannot relay. Two peers behind
+   symmetric NATs or strict firewalls will fail to connect without a TURN relay,
+   which is the usual cause of a call that rings and never connects. Credentials
+   come from env so a relay can be added without touching this file. */
+const csv = (value) => (value || '').split(',').map(s => s.trim()).filter(Boolean);
+
+const TURN_URLS = csv(import.meta.env.VITE_TURN_URLS);
+
+const ICE_SERVERS = [
+  { urls: csv(import.meta.env.VITE_STUN_URLS).length
+      ? csv(import.meta.env.VITE_STUN_URLS)
+      : ['stun:stun.l.google.com:19302'] },
+  ...(TURN_URLS.length ? [{
+    urls: TURN_URLS,
+    username: import.meta.env.VITE_TURN_USERNAME || undefined,
+    credential: import.meta.env.VITE_TURN_CREDENTIAL || undefined,
+  }] : []),
+];
+
+export const HAS_TURN = TURN_URLS.length > 0;
+
 /* ─── Connection status ─── */
 const CONN_LABELS = {
   connected:    { label: 'Connected',    className: 'text-emerald-400', dot: 'bg-emerald-400' },
@@ -109,6 +134,14 @@ export default function ChatDashboard() {
   const [addBusy, setAddBusy]     = useState(false);
   const [addError, setAddError]   = useState('');
   const [addResult, setAddResult] = useState(null);
+
+  // History paging. `stickToBottom` stops a prepended page from yanking the
+  // reader down, and also stops a new message doing it while they read back.
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const [loadingOlder, setLoadingOlder]     = useState(false);
+  const scrollBoxRef      = useRef(null);
+  const stickToBottomRef  = useRef(true);
+  const loadingOlderRef   = useRef(false);
   const [attachment, setAttachment]     = useState(null);
   const [isRecording, setIsRecording]   = useState(false);
   const fileInputRef                    = useRef(null);
@@ -154,7 +187,7 @@ export default function ChatDashboard() {
   }, []);
 
   /* ─── WebRTC Logic ─── */
-  const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  const rtcConfig = { iceServers: ICE_SERVERS };
 
   const flushPendingCandidates = async () => {
     const pc = rtcPeerConnection.current;
@@ -184,6 +217,10 @@ export default function ChatDashboard() {
 
   const initWebRTC = async (isInitiator) => {
     try {
+      if (!HAS_TURN) {
+        addLog('No TURN relay configured — a call may not connect across networks', 'pink');
+      }
+
       // If a previous capture is somehow still live, stop it first — otherwise
       // that stream becomes unreachable and its camera light never goes out.
       stopLocalCapture();
@@ -569,6 +606,8 @@ export default function ChatDashboard() {
   useEffect(() => {
     if (!peer) return;
     setMessages([]); setIntegrity(null); setPeerTyping(false);
+    setHasMoreHistory(false);
+    stickToBottomRef.current = true;
     loadHistory(peer.id);
     setTimeout(() => inputRef.current?.focus(), 100);
   }, [peer?.id]);
@@ -590,7 +629,8 @@ export default function ChatDashboard() {
 
   /* ─── Scroll + integrity on message update ─── */
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // Only follow new messages when the reader is already at the bottom.
+    if (stickToBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, peerTyping]);
 
   // Integrity depends only on the message chain. Recomputing it on replyingTo
@@ -625,34 +665,36 @@ export default function ChatDashboard() {
     }
   }, []);
 
+  /** Decrypt one page of history rows into renderable messages. */
+  const decryptRows = (rows, unreadIds) => Promise.all(rows.map(async msg => {
+    const isMine = String(msg.fromId) === String(currentUser.id);
+    if (!isMine && !msg.read && !msg.deleted) unreadIds?.push(msg.id);
+
+    if (msg.deleted) return { ...msg, text: '', isMine };
+
+    if (isMine) {
+      if (msg.senderPayload) {
+        try {
+          return { ...msg, text: await decryptMessage(msg.senderPayload, privateKey), isMine: true };
+        } catch { /* fall through to the placeholder */ }
+      }
+      return { ...msg, text: '[Sent — previous session]', isMine: true, error: true };
+    }
+    try {
+      return { ...msg, text: await decryptMessage(msg.payload, privateKey), isMine: false };
+    } catch {
+      return { ...msg, text: '[Locked — previous session key]', isMine: false, error: true };
+    }
+  }));
+
   const loadHistory = async (peerId) => {
     try {
-      const { data } = await api.get(`/api/messages/${peerId}?_t=${Date.now()}`);
       const unreadIds = [];
-      const history = await Promise.all(data.map(async msg => {
-        const isMine = String(msg.fromId) === String(currentUser.id);
-        if (!isMine && !msg.read && !msg.deleted) unreadIds.push(msg.id);
-        
-        if (msg.deleted) {
-          return { ...msg, text: '', isMine };
-        }
-
-        if (isMine) {
-          if (msg.senderPayload) {
-            try {
-              const text = await decryptMessage(msg.senderPayload, privateKey);
-              return { ...msg, text, isMine: true };
-            } catch { }
-          }
-          return { ...msg, text: '[Sent — previous session]', isMine: true, error: true };
-        }
-        try {
-          return { ...msg, text: await decryptMessage(msg.payload, privateKey), isMine: false };
-        } catch {
-          return { ...msg, text: '[Locked — previous session key]', isMine: false, error: true };
-        }
-      }));
+      const { data } = await api.get(`/api/messages/${peerId}?limit=${PAGE_SIZE}&_t=${Date.now()}`);
+      const history = await decryptRows(data, unreadIds);
       setMessages(history);
+      // A full page suggests there is more behind it; a short page is the end.
+      setHasMoreHistory(data.length === PAGE_SIZE);
 
       if (unreadIds.length > 0 && document.hasFocus() && socketRef.current) {
         socketRef.current.emit('message_read', { messageIds: unreadIds, toId: peerId });
@@ -661,6 +703,55 @@ export default function ChatDashboard() {
     } catch (err) {
       addLog(`Could not load history: ${err.message}`, 'pink');
     }
+  };
+
+  const loadOlderMessages = async () => {
+    const peerId = peerRef.current?.id;
+    const oldest = messages[0];
+    // Guard with a ref, not state: scroll fires far faster than React re-renders.
+    if (!peerId || !oldest || loadingOlderRef.current || !hasMoreHistory) return;
+
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+
+    const box = scrollBoxRef.current;
+    const prevHeight = box?.scrollHeight ?? 0;
+    const prevTop    = box?.scrollTop ?? 0;
+
+    try {
+      // Cursor on the oldest loaded message rather than an offset, so live
+      // arrivals can't shift the window and skip a page.
+      const before = new Date(oldest.timestamp).toISOString();
+      const { data } = await api.get(
+        `/api/messages/${peerId}?limit=${PAGE_SIZE}&before=${encodeURIComponent(before)}`
+      );
+
+      if (data.length === 0) { setHasMoreHistory(false); return; }
+
+      const older = await decryptRows(data, null);
+      setMessages(prev => {
+        const known = new Set(prev.map(m => String(m.id)));
+        return [...older.filter(m => !known.has(String(m.id))), ...prev];
+      });
+      setHasMoreHistory(data.length === PAGE_SIZE);
+
+      // Hold the reader's place: the prepended block grows scrollHeight, so
+      // shift scrollTop by exactly that much.
+      requestAnimationFrame(() => {
+        if (box) box.scrollTop = prevTop + (box.scrollHeight - prevHeight);
+      });
+    } catch (err) {
+      addLog(`Could not load older messages: ${err.message}`, 'pink');
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlder(false);
+    }
+  };
+
+  const handleMessagesScroll = (e) => {
+    const box = e.currentTarget;
+    stickToBottomRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    if (box.scrollTop < 80) loadOlderMessages();
   };
 
   const handleTyping = (e) => {
@@ -1199,8 +1290,26 @@ export default function ChatDashboard() {
               )}
             </AnimatePresence>
 
-            <div className="flex-1 overflow-y-auto px-4 py-5" style={{ backgroundImage: "url('/whatsapp-bg.png')", backgroundSize: 'cover', backgroundBlendMode: 'overlay', backgroundColor: 'rgba(10,15,30,0.92)' }}>
+            <div ref={scrollBoxRef} onScroll={handleMessagesScroll} className="flex-1 overflow-y-auto px-4 py-5" style={{ backgroundImage: "url('/whatsapp-bg.png')", backgroundSize: 'cover', backgroundBlendMode: 'overlay', backgroundColor: 'rgba(10,15,30,0.92)' }}>
               <div className="flex flex-col gap-3">
+                {loadingOlder && (
+                  <div className="flex items-center justify-center gap-2 py-2 text-[10px] text-slate-500">
+                    <Loader2 size={11} className="animate-spin" /> Loading older messages…
+                  </div>
+                )}
+                {hasMoreHistory && !loadingOlder && (
+                  <button
+                    type="button" onClick={loadOlderMessages}
+                    className="mx-auto text-[10px] text-slate-500 hover:text-cyan-300 px-3 py-1 rounded-full border border-white/10 hover:border-cyan-400/30 transition-colors"
+                  >
+                    Load older messages
+                  </button>
+                )}
+                {!hasMoreHistory && messages.length > 0 && (
+                  <div className="text-center text-[10px] text-slate-600 py-1">
+                    Beginning of your encrypted conversation
+                  </div>
+                )}
                 <AnimatePresence initial={false}>
                   {messages.map((msg, i) => {
                     const isGrouped = i > 0 && messages[i - 1].isMine === msg.isMine;
