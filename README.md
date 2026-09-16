@@ -7,7 +7,8 @@ QChat is a next-generation End-to-End Encrypted (E2EE) messaging platform built 
 - **Backend**: Node.js, Express, Socket.io, MongoDB (Mongoose).
 - **Cryptography**: ML-KEM-768, AES-256-GCM, SHA-256.
 - **Real-Time Media**: WebRTC peer-to-peer video calling, with signaling encrypted per-message via ML-KEM/AES-256-GCM.
-- **Messaging Features**: image/audio/file attachments, voice notes, reply threading, emoji reactions, delete-for-everyone, online/last-seen presence.
+- **Messaging Features**: image/audio/file attachments, voice notes, reply threading, emoji reactions, delete-for-everyone, online/last-seen presence, paged history.
+- **Identity & Access**: JWT-authenticated REST *and* Socket.io layers, contact discovery by shareable QChat ID, rate limiting, helmet.
 
 ---
 
@@ -28,12 +29,21 @@ npm install
 ```
 
 ### 2. Configure Environment
-Create a `.env` file in the `backend/` directory:
+Copy `backend/.env.example` to `backend/.env` and fill it in:
 ```
 PORT=5000
-JWT_SECRET=your-secure-secret
+JWT_SECRET=<generate with: openssl rand -hex 32>
+JWT_EXPIRES_IN=7d
 MONGO_URI=mongodb://localhost:27017/qchat
+CORS_ORIGIN=http://localhost:5173
 ```
+The server **refuses to boot** on a missing, placeholder, or under-32-character
+`JWT_SECRET` — a guessable signing key would make every token in the system
+forgeable, so failing loudly beats running insecurely.
+
+The frontend needs no configuration for local dev (an empty `VITE_API_URL` routes
+`/api` through the Vite proxy). For a deployment, or to enable TURN, copy
+`frontend/.env.example` to `frontend/.env.local`.
 
 ### 3. Run Development Servers
 ```bash
@@ -290,7 +300,22 @@ socket.on('webrtc_signal', ({ toId, fromId, signalPayload }) => {
 
 Once both sides exchange an encrypted offer/answer and ICE candidates, `RTCPeerConnection` establishes a direct peer-to-peer media path. Call state (`idle → calling/receiving → connected`) is tracked client-side; hanging up sends an encrypted `end_call` signal so both peers tear down cleanly.
 
-> **Known limitation:** the current ICE configuration only lists a public STUN server. Calls across symmetric NATs or restrictive firewalls may fail to connect without a TURN server. Tracked in `improve.txt` → `OPS-3`.
+#### ICE and TURN
+STUN only tells a peer its own public address; it cannot relay traffic. Two peers
+behind symmetric NATs or strict firewalls will therefore fail to connect on STUN
+alone — the classic symptom being a call that rings and never connects. ICE
+servers are configured through env so a relay can be added without a code change:
+
+```
+VITE_STUN_URLS=stun:stun.l.google.com:19302
+VITE_TURN_URLS=turn:your-relay:3478,turns:your-relay:5349
+VITE_TURN_USERNAME=...
+VITE_TURN_CREDENTIAL=...
+```
+
+With no TURN configured the client logs a warning to the in-app protocol console
+when a call starts, so the limitation is visible rather than silent. Standing up
+the relay itself (e.g. coturn) is still outstanding — `improve.txt` → `OPS-3`.
 
 ## 6. Messaging Features (Attachments, Replies, Reactions, Delete, Presence)
 
@@ -302,4 +327,49 @@ Beyond text, QChat's chat surface supports the messaging primitives users expect
 - **Delete for everyone** — deleting a message is a soft delete: the server clears `payload`/`sender_payload` and sets `deleted: true`; clients render a tombstone rather than removing the message outright.
 - **Presence** — `User.is_online` and `User.last_seen` are updated on socket connect/disconnect and broadcast via `user_status`, driving the online dot and "Last seen …" text in the UI.
 
-> **Known limitations:** reactions aren't currently deduplicated per user, and attachments are stored inline rather than in dedicated blob storage. Tracked in `improve.txt` → `BUG-1` and `OPS-4`.
+Reactions toggle per (message, user, emoji): the server holds the authoritative
+array and clients replace rather than append, so a reaction can't be double
+counted by the sender's own echo.
+
+History is paged at 50 messages. Scrolling to the top loads the previous page
+using a **timestamp cursor** rather than an offset — an offset shifts when live
+messages arrive mid-scroll, which silently skips a page — and the scroll position
+is preserved across the prepend.
+
+> **Known limitation:** attachments are base64-encoded, encrypted twice (once for
+> each party) and stored inline in the message document rather than in dedicated
+> blob storage. Tracked in `improve.txt` → `OPS-4`.
+
+## 7. Identity, Contacts & Access Control
+
+### 7.1 Authenticated Transport
+Both layers authenticate independently. REST routes verify a bearer JWT; the
+Socket.io layer verifies the same token **during the handshake** and every event
+derives its actor from `socket.user`, never from the event payload:
+
+```javascript
+io.use(authenticateSocket);
+
+io.on('connection', (socket) => {
+  const userId = socket.user.id;   // from the verified token, not the client
+  socket.join(userId);
+  ...
+});
+```
+
+This matters: an earlier revision took the actor id from the message body, which
+let any client send messages as another user, delete their messages, or register
+with a victim's id and drain their queued offline messages. Each socket joins a
+room named after its user id, so presence and delivery work across multiple tabs.
+
+### 7.2 Contact Discovery by QChat ID
+Every account gets a shareable id such as `QC-8L99-2TVY`, drawn from a
+Crockford-style alphabet that omits `0`, `O`, `1` and `I` so a code read aloud or
+copied by hand cannot land on the wrong account.
+
+The contact list is not a directory. `GET /api/users` returns only the people you
+have added plus anyone you have exchanged messages with — so a first message
+reveals the sender without needing a friend-request round trip, while the rest of
+the user base stays invisible. Lookup is **exact match only**, on the id alone,
+and separately rate limited, so the endpoint cannot be used to enumerate accounts
+or to check whether a given username exists.
