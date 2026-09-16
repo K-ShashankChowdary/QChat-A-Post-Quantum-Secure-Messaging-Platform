@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import axios from 'axios';
+import api from '../lib/api';
 import { useNavigate } from 'react-router-dom';
 import { generateKeyPair, b64encode } from '../crypto/encryption';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -43,7 +43,7 @@ export default function Register() {
       const kp = await generateKeyPair();
       setSubmitting(true);
       const pubB64 = b64encode(kp.publicKey);
-      const { data } = await axios.post('/api/auth/register', {
+      const { data } = await api.post('/api/auth/register', {
         username, password, publicKey: pubB64
       });
       

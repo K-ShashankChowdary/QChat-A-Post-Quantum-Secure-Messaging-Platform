@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import axios from 'axios';
+import api from '../lib/api';
 import { useNavigate } from 'react-router-dom';
 import { generateKeyPair, b64encode } from '../crypto/encryption';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -17,7 +17,7 @@ export default function Login() {
     setIsLoading(true);
     setError('');
     try {
-      const { data } = await axios.post('/api/auth/login', { username, password });
+      const { data } = await api.post('/api/auth/login', { username, password });
       localStorage.setItem('qchat_token', data.token);
       localStorage.setItem('qchat_user', JSON.stringify(data.user));
 
@@ -35,19 +35,13 @@ export default function Login() {
         localStorage.setItem(pubKeyName, pubB64);
         sessionStorage.removeItem('qchat_last_peer'); // clear last peer for fresh setup
         
-        await axios.post('/api/auth/update-key',
-          { userId: data.user.id, publicKey: pubB64 },
-          { headers: { Authorization: `Bearer ${data.token}` } }
-        );
+        await api.post('/api/auth/update-key', { userId: data.user.id, publicKey: pubB64 });
         localStorage.setItem('qchat_user', JSON.stringify({ ...data.user, publicKey: pubB64 }));
       } else {
         // We already have a persistent key on this device! 
         // Force the backend to use THIS device's public key (in case they logged in elsewhere recently)
         if (data.user.publicKey !== existingPub) {
-          await axios.post('/api/auth/update-key',
-            { userId: data.user.id, publicKey: existingPub },
-            { headers: { Authorization: `Bearer ${data.token}` } }
-          );
+          await api.post('/api/auth/update-key', { userId: data.user.id, publicKey: existingPub });
         }
         localStorage.setItem('qchat_user', JSON.stringify({ ...data.user, publicKey: existingPub }));
       }

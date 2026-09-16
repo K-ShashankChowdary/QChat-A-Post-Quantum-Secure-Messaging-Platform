@@ -1,10 +1,9 @@
 import mongoose from 'mongoose';
-import dotenv from 'dotenv';
 import { logger } from '../utils/logger.js';
+import config from '../config/env.js';
+import { allocateQChatId } from '../utils/qchatId.js';
 
-dotenv.config();
-
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/qchat';
+const MONGO_URI = config.mongoUri;
 
 export const connectDB = async () => {
   try {
@@ -25,12 +24,36 @@ const userSchema = new mongoose.Schema({
   username:      { type: String, required: true, unique: true },
   password_hash: { type: String, required: true },
   public_key:    { type: String },
+  // Shareable handle (QC-XXXX-XXXX). Random rather than derived from the
+  // username, so accounts can't be found by guessing names.
+  qchat_id:      { type: String, unique: true, sparse: true, index: true },
+  // People this user explicitly added. The contact list also surfaces anyone
+  // they've exchanged messages with, so a first message reveals the sender
+  // without needing a friend-request round trip.
+  contacts:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   created_at:    { type: Date, default: Date.now },
   last_seen:     { type: Date, default: Date.now },
   is_online:     { type: Boolean, default: false }
 });
 
 export const User = mongoose.model('User', userSchema);
+
+/** Give any pre-existing account a QChat ID. Runs once at boot; no-op after. */
+export const backfillQChatIds = async () => {
+  const missing = await User.find({ $or: [{ qchat_id: { $exists: false } }, { qchat_id: null }] }).select('_id username');
+  if (missing.length === 0) return;
+
+  logger.db(`Backfilling QChat IDs for ${missing.length} existing user(s)`);
+  for (const user of missing) {
+    try {
+      user.qchat_id = await allocateQChatId(User);
+      await user.save();
+      logger.db(`Assigned ${user.qchat_id}`, { username: user.username });
+    } catch (err) {
+      logger.error('QChat ID backfill failed', { username: user.username, message: err.message }, 'DB');
+    }
+  }
+};
 
 // Message Schema
 const messageSchema = new mongoose.Schema({
