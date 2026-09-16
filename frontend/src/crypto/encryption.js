@@ -110,6 +110,146 @@ export async function decryptMessage(payload, myPrivateKey) {
   }
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+   Payload v2
+
+   Two changes over v1, both version-tagged so existing messages keep working:
+
+   1. HKDF-SHA256 with a random salt and context string replaces the bare
+      SHA-256(sharedSecret) used as an AES key. A hash is not a KDF: HKDF is the
+      standard construction, binds the key to a context, and is what a reviewer
+      expects next to a NIST-standardised KEM.
+
+   2. The content is encrypted ONCE under a random content-encryption key (CEK),
+      and only that 32-byte CEK is wrapped to each party via ML-KEM. v1 encrypted
+      the whole message twice (once per party), which doubled both the lattice
+      work and the stored bytes — painful for a 2MB attachment.
+   ───────────────────────────────────────────────────────────────────────── */
+
+export const PAYLOAD_VERSION = 2;
+const KDF_INFO_WRAP = 'QChat/v2/cek-wrap';
+const SALT_BYTES = 16;
+const IV_BYTES = 12;
+const TAG_BYTES = 16;
+const CEK_BYTES = 32;
+
+/** HKDF-SHA256 -> AES-256-GCM key. */
+async function deriveWrapKey(sharedSecret, salt, usages) {
+  const base = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt, info: new TextEncoder().encode(KDF_INFO_WRAP) },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    usages
+  );
+}
+
+/** WebCrypto wants ciphertext and tag contiguous; we store them apart. */
+function joinCipherAndTag(ciphertextB64, authTagB64) {
+  const ct = b64decode(ciphertextB64);
+  const tag = b64decode(authTagB64);
+  const joined = new Uint8Array(ct.length + tag.length);
+  joined.set(ct);
+  joined.set(tag, ct.length);
+  return joined;
+}
+
+function splitCipherAndTag(buffer) {
+  const arr = new Uint8Array(buffer);
+  return {
+    ciphertext: b64encode(arr.slice(0, -TAG_BYTES)),
+    authTag: b64encode(arr.slice(-TAG_BYTES)),
+  };
+}
+
+/**
+ * Encrypt once, wrap the key for everyone who should be able to read it.
+ * `recipients` is [{ id, publicKey: Uint8Array }] — normally the peer and
+ * yourself, so you can still read your own history.
+ */
+export async function encryptForRecipients(text, recipients) {
+  if (typeof text !== 'string' || text.length === 0) throw new Error('EMPTY_MESSAGE');
+  if (!Array.isArray(recipients) || recipients.length === 0) throw new Error('NO_RECIPIENTS');
+
+  try {
+    const cek = crypto.getRandomValues(new Uint8Array(CEK_BYTES));
+    const contentKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
+    const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+    const sealed = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      contentKey,
+      new TextEncoder().encode(text)
+    );
+
+    const keys = {};
+    for (const recipient of recipients) {
+      const pub = recipient?.publicKey;
+      if (!pub || pub.byteLength !== 1184) {
+        throw new Error(`INVALID_PUBLIC_KEY: expected 1184 bytes, got ${pub?.byteLength}`);
+      }
+
+      const { sharedSecret, cipherText: encapsulatedKey } = ml_kem768.encapsulate(pub);
+      const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+      const wrapKey = await deriveWrapKey(sharedSecret, salt, ['encrypt']);
+      const wrapIv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
+      const wrapped = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: wrapIv }, wrapKey, cek);
+
+      keys[String(recipient.id)] = {
+        encapsulatedKey: b64encode(encapsulatedKey),
+        salt: b64encode(salt),
+        nonce: b64encode(wrapIv),
+        ...splitCipherAndTag(wrapped),
+      };
+    }
+
+    return {
+      v: PAYLOAD_VERSION,
+      keys,
+      nonce: b64encode(iv),
+      ...splitCipherAndTag(sealed),
+      timestamp: Date.now(),
+    };
+  } catch (error) {
+    if (String(error.message).startsWith('INVALID_PUBLIC_KEY')) throw error;
+    console.error('Encryption failed:', error);
+    throw new Error('ENCRYPTION_FAILED');
+  }
+}
+
+/**
+ * Decrypt either format. v2 unwraps the CEK addressed to `myUserId`; anything
+ * else falls back to the v1 path so old messages keep opening.
+ */
+export async function decryptEnvelope(payload, myUserId, myPrivateKey) {
+  if (payload?.v !== PAYLOAD_VERSION) return decryptMessage(payload, myPrivateKey);
+
+  const wrapped = payload.keys?.[String(myUserId)];
+  if (!wrapped) throw new Error('NO_KEY_FOR_RECIPIENT');
+
+  try {
+    const sharedSecret = ml_kem768.decapsulate(b64decode(wrapped.encapsulatedKey), myPrivateKey);
+    const wrapKey = await deriveWrapKey(sharedSecret, b64decode(wrapped.salt), ['decrypt']);
+    const cek = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: b64decode(wrapped.nonce) },
+      wrapKey,
+      joinCipherAndTag(wrapped.ciphertext, wrapped.authTag)
+    );
+
+    const contentKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['decrypt']);
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: b64decode(payload.nonce) },
+      contentKey,
+      joinCipherAndTag(payload.ciphertext, payload.authTag)
+    );
+
+    return new TextDecoder().decode(plain);
+  } catch (error) {
+    console.error('Decryption failed:', error);
+    throw new Error('DECRYPTION_FAILED');
+  }
+}
+
 // Builds a rolling SHA-256 hash chain of the conversation history
 export async function calculateIntegrity(messages) {
   if (!messages || messages.length === 0) return '0x0000...';

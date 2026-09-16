@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { io } from 'socket.io-client';
 import { useNavigate } from 'react-router-dom';
 import api, { SOCKET_URL, clearSession } from '../lib/api';
-import { encryptMessage, decryptMessage, b64decode, calculateIntegrity } from '../crypto/encryption';
+import { encryptForRecipients, decryptEnvelope, b64decode, calculateIntegrity } from '../crypto/encryption';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Send, Terminal, LogOut, Lock, Fingerprint,
@@ -206,8 +206,9 @@ export default function ChatDashboard() {
   const encryptAndSendSignal = async (signalData, toId) => {
     try {
       if (!peerRef.current?.public_key) return;
-      const recipientPubKey = b64decode(peerRef.current.public_key);
-      const payload = await encryptMessage(JSON.stringify(signalData), recipientPubKey);
+      const payload = await encryptForRecipients(JSON.stringify(signalData), [
+        { id: String(peerRef.current.id), publicKey: b64decode(peerRef.current.public_key) },
+      ]);
       socketRef.current?.emit('webrtc_signal', { toId, signalPayload: payload });
       addLog(`Sent encrypted WebRTC signal (${signalData.type || 'candidate'})`, 'cyan');
     } catch (err) {
@@ -260,7 +261,7 @@ export default function ChatDashboard() {
 
   const handleWebRTCSignal = async (fromId, signalPayload) => {
     try {
-      const decrypted = await decryptMessage(signalPayload, privateKey);
+      const decrypted = await decryptEnvelope(signalPayload, currentUser.id, privateKey);
       const signal = JSON.parse(decrypted);
       addLog(`Received encrypted WebRTC signal (${signal.type || 'candidate'})`, 'green');
 
@@ -500,7 +501,7 @@ export default function ChatDashboard() {
       }
 
       try {
-        const text = await decryptMessage(msg.payload, privateKey);
+        const text = await decryptEnvelope(msg.payload, currentUser.id, privateKey);
         
         if (peerRef.current && String(peerRef.current.id) === String(msg.fromId)) {
           setMessages(prev => {
@@ -544,9 +545,10 @@ export default function ChatDashboard() {
     // The server toggles and returns the authoritative array. Replacing rather
     // than appending is what stops your own reaction counting twice — once
     // optimistically, then again when the echo comes back.
-    s.on('message_reaction', ({ messageId, reactions }) => {
+    s.on('message_reaction', async ({ messageId, reactions }) => {
+      const hydrated = await hydrateReactions(reactions);
       setMessages(prev => prev.map(m =>
-        String(m.id) === String(messageId) ? { ...m, reactions: reactions || [] } : m
+        String(m.id) === String(messageId) ? { ...m, reactions: hydrated } : m
       ));
     });
 
@@ -670,21 +672,25 @@ export default function ChatDashboard() {
     const isMine = String(msg.fromId) === String(currentUser.id);
     if (!isMine && !msg.read && !msg.deleted) unreadIds?.push(msg.id);
 
-    if (msg.deleted) return { ...msg, text: '', isMine };
+    if (msg.deleted) return { ...msg, text: '', isMine, reactions: [] };
 
-    if (isMine) {
-      if (msg.senderPayload) {
-        try {
-          return { ...msg, text: await decryptMessage(msg.senderPayload, privateKey), isMine: true };
-        } catch { /* fall through to the placeholder */ }
-      }
-      return { ...msg, text: '[Sent — previous session]', isMine: true, error: true };
-    }
+    const reactions = await hydrateReactions(msg.reactions);
+
+    // v2 addresses both parties in one payload; v1 kept a separate sender copy.
     try {
-      return { ...msg, text: await decryptMessage(msg.payload, privateKey), isMine: false };
-    } catch {
-      return { ...msg, text: '[Locked — previous session key]', isMine: false, error: true };
+      return { ...msg, reactions, text: await decryptEnvelope(msg.payload, currentUser.id, privateKey), isMine };
+    } catch { /* fall through to the v1 sender copy */ }
+
+    if (isMine && msg.senderPayload) {
+      try {
+        return { ...msg, reactions, text: await decryptEnvelope(msg.senderPayload, currentUser.id, privateKey), isMine: true };
+      } catch { /* fall through to the placeholder */ }
     }
+
+    return {
+      ...msg, reactions, isMine, error: true,
+      text: isMine ? '[Sent — previous session]' : '[Locked — previous session key]',
+    };
   }));
 
   const loadHistory = async (peerId) => {
@@ -836,14 +842,11 @@ export default function ChatDashboard() {
     socketRef.current.emit('stop_typing', { toId: peer.id });
     setEncrypting(true);
     try {
-      const recipientPubKey = b64decode(peer.public_key);
-      const payload = await encryptMessage(textToSend, recipientPubKey);
-      let senderPayload = null;
-      const parsedUser = JSON.parse(localStorage.getItem('qchat_user') || '{}');
-      const myPubKeyB64 = parsedUser.publicKey || parsedUser.public_key;
-      if (myPubKeyB64) {
-        senderPayload = await encryptMessage(textToSend, b64decode(myPubKeyB64));
-      }
+      // v2: encrypt once and wrap the content key per party. v1 encrypted the
+      // whole message twice, doubling both the lattice work and stored bytes.
+      const recipients = buildRecipients();
+      if (recipients.length === 0) throw new Error('NO_RECIPIENT_KEYS');
+      const payload = await encryptForRecipients(textToSend, recipients);
       
       const tempId = `l-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       setMessages(prev => [...prev, {
@@ -852,7 +855,7 @@ export default function ChatDashboard() {
       }]);
 
       socketRef.current?.emit('send_message', {
-        tempId, toId: peer.id, payload, senderPayload,
+        tempId, toId: peer.id, payload, senderPayload: null,
         type: msgType, replyToId
       });
     } catch (err) {
@@ -869,21 +872,58 @@ export default function ChatDashboard() {
     setMessages(prev => prev.map(m => String(m.id) === String(messageId) ? { ...m, deleted: true, text: '', type: 'text' } : m));
   };
 
-  const sendReaction = (messageId, emoji) => {
+  const sendReaction = async (messageId, emoji) => {
     if (!isRealId(messageId)) return addLog('Still sending — try again in a moment', 'pink');
-    socketRef.current?.emit('message_reaction', { messageId, emoji });
-    // Mirror the server's toggle so the bubble doesn't flicker before the echo.
-    setMessages(prev => prev.map(m => {
-      if (String(m.id) !== String(messageId)) return m;
-      const reactions = m.reactions || [];
-      const idx = reactions.findIndex(r => String(r.user_id) === String(currentUser.id) && r.emoji === emoji);
-      return {
-        ...m,
-        reactions: idx >= 0 ? reactions.filter((_, i) => i !== idx)
-                            : [...reactions, { emoji, user_id: currentUser.id }],
-      };
+
+    const target  = messages.find(m => String(m.id) === String(messageId));
+    const current = target?.reactions?.find(r => String(r.user_id) === String(currentUser.id))?.emojis || [];
+    const next    = current.includes(emoji) ? current.filter(e => e !== emoji) : [...current, emoji];
+
+    // The server stores the emoji set encrypted and can't inspect it, so the
+    // toggle is computed here and the whole set is sent.
+    setMessages(prev => prev.map(m => String(m.id) !== String(messageId) ? m : {
+      ...m,
+      reactions: [
+        ...(m.reactions || []).filter(r => String(r.user_id) !== String(currentUser.id)),
+        ...(next.length ? [{ user_id: String(currentUser.id), emojis: next }] : []),
+      ],
     }));
+
+    try {
+      const payload = next.length
+        ? await encryptForRecipients(JSON.stringify(next), buildRecipients())
+        : null;
+      socketRef.current?.emit('message_reaction', { messageId, payload });
+    } catch (err) {
+      addLog(`Could not send reaction: ${err.message}`, 'pink');
+    }
   };
+
+  /** Everyone who should be able to read what we send: the peer and ourselves. */
+  const buildRecipients = () => {
+    const stored = JSON.parse(localStorage.getItem('qchat_user') || '{}');
+    const myPub = stored.publicKey || stored.public_key;
+    const list = [];
+    if (peerRef.current?.public_key) {
+      list.push({ id: String(peerRef.current.id), publicKey: b64decode(peerRef.current.public_key) });
+    }
+    if (myPub) list.push({ id: String(currentUser.id), publicKey: b64decode(myPub) });
+    return list;
+  };
+
+  /** Turn stored reaction rows into { user_id, emojis } the UI can aggregate. */
+  const hydrateReactions = async (rows) => Promise.all((rows || []).map(async (r) => {
+    if (r.payload) {
+      try {
+        const emojis = JSON.parse(await decryptEnvelope(r.payload, currentUser.id, privateKey));
+        return { user_id: String(r.user_id), emojis: Array.isArray(emojis) ? emojis : [] };
+      } catch {
+        return { user_id: String(r.user_id), emojis: [] };
+      }
+    }
+    // Pre-v2 plaintext reaction.
+    return { user_id: String(r.user_id), emojis: r.emoji ? [r.emoji] : [] };
+  }));
 
   const copyMyId = async () => {
     if (!myProfile?.qchatId) return;
@@ -1006,7 +1046,7 @@ export default function ChatDashboard() {
   /** Click-toggled reaction menu. */
   const renderReactionButton = (msg, align = 'left') => {
     const open = reactionPickerFor === msg.id;
-    const mine = msg.reactions || [];
+    const myEmojis = (msg.reactions || []).find(r => String(r.user_id) === String(currentUser.id))?.emojis || [];
     return (
       <div className="relative">
         <button
@@ -1028,7 +1068,7 @@ export default function ChatDashboard() {
             className={`absolute bottom-full mb-2 ${align === 'right' ? 'right-0' : 'left-0'} flex items-center gap-0.5 bg-navy-800 p-1.5 rounded-full border border-white/10 shadow-xl z-50`}
           >
             {REACTION_EMOJIS.map(em => {
-              const active = mine.some(r => String(r.user_id) === String(currentUser.id) && r.emoji === em);
+              const active = myEmojis.includes(em);
               return (
                 <button
                   key={em}
@@ -1051,13 +1091,16 @@ export default function ChatDashboard() {
   const renderReactions = (msg) => {
     const reactions = msg.reactions || [];
     if (reactions.length === 0) return null;
-    // Group identical emojis, tracking whether this user is among the reactors.
-    const counts = reactions.reduce((acc, r) => {
-      const entry = acc[r.emoji] || (acc[r.emoji] = { count: 0, mine: false });
-      entry.count++;
-      if (String(r.user_id) === String(currentUser.id)) entry.mine = true;
-      return acc;
-    }, {});
+    // Each row is one user's whole emoji set; flatten into per-emoji counts.
+    const counts = {};
+    for (const row of reactions) {
+      for (const emoji of row.emojis || []) {
+        const entry = counts[emoji] || (counts[emoji] = { count: 0, mine: false });
+        entry.count++;
+        if (String(row.user_id) === String(currentUser.id)) entry.mine = true;
+      }
+    }
+    if (Object.keys(counts).length === 0) return null;
     return (
       <div className="flex items-center gap-1 mt-1 -mb-3 ml-1 z-20 relative drop-shadow-md">
         {Object.entries(counts).map(([emoji, { count, mine: isMine }]) => (

@@ -67,9 +67,14 @@ const messageSchema = new mongoose.Schema({
   reply_to_id:    { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null },
   deleted:        { type: Boolean, default: false },
   type:           { type: String, default: 'text', enum: ['text', 'image', 'audio', 'file'] },
-  reactions:      [{ 
-    emoji: { type: String },
-    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  // One entry per reacting user. `payload` is their whole emoji set, encrypted
+  // to both participants, so the server stores it blind — it can upsert and
+  // delete but never learns which emoji was used. `emoji` is the pre-v2
+  // plaintext field, kept only so old reactions still render.
+  reactions:      [{
+    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    emoji:   { type: String },
+    payload: { type: Object }
   }]
 });
 

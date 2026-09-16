@@ -250,10 +250,14 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('message_reaction', async ({ messageId, emoji }) => {
+  socket.on('message_reaction', async ({ messageId, payload }) => {
     try {
       if (!isValidObjectId(messageId)) return;
-      if (typeof emoji !== 'string' || emoji.length === 0 || emoji.length > 16) return;
+      // The emoji set is encrypted, so the server can't inspect or toggle it.
+      // The client sends its complete set; we blindly replace that user's entry,
+      // or drop it when the set is empty.
+      if (payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) return;
+      if (approximateSize(payload) > 64 * 1024) return;
 
       const msg = await Message.findById(messageId);
       if (!msg) return;
@@ -263,12 +267,9 @@ io.on('connection', async (socket) => {
         return logger.warn('message_reaction: not a participant', { messageId, userId }, 'Socket');
       }
 
-      // Toggle rather than push, so repeat taps don't inflate the count.
-      const existing = msg.reactions.findIndex(
-        r => String(r.user_id) === userId && r.emoji === emoji
-      );
+      const existing = msg.reactions.findIndex(r => String(r.user_id) === userId);
       if (existing >= 0) msg.reactions.splice(existing, 1);
-      else msg.reactions.push({ emoji, user_id: userId });
+      if (payload) msg.reactions.push({ user_id: userId, payload });
       await msg.save();
 
       // Broadcast the authoritative array; clients replace rather than append,
