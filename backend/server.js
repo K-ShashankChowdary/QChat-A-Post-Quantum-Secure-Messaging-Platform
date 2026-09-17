@@ -274,9 +274,12 @@ io.on('connection', async (socket) => {
 
       // Broadcast the authoritative array; clients replace rather than append,
       // which is what stops a reaction being counted twice on the sender's side.
-      const payload = { messageId, reactions: msg.reactions };
+      // Named `update`, not `payload`: a `const payload` here is block-scoped to
+      // this try, so it shadows the handler's own `payload` argument and puts
+      // every earlier read of it in the temporal dead zone.
+      const update = { messageId, reactions: msg.reactions };
       for (const participant of new Set(participants)) {
-        io.to(participant).emit('message_reaction', payload);
+        io.to(participant).emit('message_reaction', update);
       }
     } catch (err) {
       logger.error('Failed to add reaction', { message: err.message }, 'Socket');
