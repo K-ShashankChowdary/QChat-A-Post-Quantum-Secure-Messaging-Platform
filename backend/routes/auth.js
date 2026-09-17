@@ -5,7 +5,7 @@ import { User } from '../db/database.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
 import config from '../config/env.js';
-import { validateUsername, validatePassword, validatePublicKey } from '../utils/validation.js';
+import { validateUsername, validatePassword, validatePublicKey, validateKeyBackup } from '../utils/validation.js';
 import { allocateQChatId } from '../utils/qchatId.js';
 
 const router = express.Router();
@@ -16,13 +16,14 @@ const issueToken = (user) =>
 
 /* ── POST /api/auth/register ── */
 router.post('/register', async (req, res) => {
-  const { password, publicKey } = req.body;
+  const { password, publicKey, keyBackup } = req.body;
   const username = typeof req.body.username === 'string' ? req.body.username.trim() : req.body.username;
   logger.info('Register attempt', { username }, CTX);
 
   // Validated server-side: the React form's rules are advisory only, since the
   // API can be called directly (see improve.txt SEC-3).
-  const invalid = validateUsername(username) || validatePassword(password) || validatePublicKey(publicKey);
+  const invalid = validateUsername(username) || validatePassword(password)
+    || validatePublicKey(publicKey) || validateKeyBackup(keyBackup);
   if (invalid) {
     logger.warn('Register: validation failed', { username, reason: invalid }, CTX);
     return res.status(400).json({ error: invalid });
@@ -31,7 +32,10 @@ router.post('/register', async (req, res) => {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const qchatId = await allocateQChatId(User);
-    const user = new User({ username, password_hash: passwordHash, public_key: publicKey, qchat_id: qchatId });
+    const user = new User({
+      username, password_hash: passwordHash, public_key: publicKey,
+      qchat_id: qchatId, key_backup: keyBackup || null,
+    });
     await user.save();
     logger.info('Registered new user', { username, id: user._id, qchatId }, CTX);
 
@@ -74,10 +78,33 @@ router.post('/login', async (req, res) => {
     res.json({
       token: issueToken(user),
       user: { id: user._id, username: user.username, publicKey: user.public_key, qchatId: user.qchat_id },
+      // Returned so a device with no stored key can recover the account's
+      // original private key rather than generating a replacement.
+      keyBackup: user.key_backup || null,
     });
   } catch (error) {
     logger.error('Login: unexpected error', { message: error.message }, CTX);
     res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+/* ── POST /api/auth/key-backup ──
+   Stores (or replaces) the encrypted private key. Used at first sign-in for
+   accounts created before backups existed, and after a password change. */
+router.post('/key-backup', authenticateToken, async (req, res) => {
+  const { keyBackup } = req.body;
+
+  const invalid = validateKeyBackup(keyBackup);
+  if (invalid) return res.status(400).json({ error: invalid });
+  if (!keyBackup) return res.status(400).json({ error: 'Key backup is required' });
+
+  try {
+    await User.findByIdAndUpdate(req.user.id, { key_backup: keyBackup });
+    logger.info('Key backup stored', { userId: req.user.id }, CTX);
+    res.json({ stored: true });
+  } catch (error) {
+    logger.error('Key backup failed', { message: error.message }, CTX);
+    res.status(500).json({ error: 'Could not store key backup' });
   }
 });
 

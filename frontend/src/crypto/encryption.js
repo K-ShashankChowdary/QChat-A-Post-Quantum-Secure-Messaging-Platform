@@ -250,6 +250,114 @@ export async function decryptEnvelope(payload, myUserId, myPrivateKey) {
   }
 }
 
+/* ─── Password-wrapped key backup ───
+   The private key must never leave the device in the clear, but a key that
+   exists in exactly one browser is one cleared-site-data away from orphaning
+   every message ever sent to it. So we store an ENCRYPTED copy server-side:
+   PBKDF2 stretches the password into an AES-256-GCM key, and only the resulting
+   ciphertext is uploaded. The server holds a blob it cannot open.
+
+   Honest limit: the server also receives the password at sign-in to check it
+   against the bcrypt hash, so this defends against a stolen database — the
+   realistic threat — not against a malicious server. Deriving a separate
+   client-side auth value so the raw password never leaves the browser would
+   close that gap, and is the natural next step. */
+
+export const KEY_BACKUP_VERSION = 1;
+const PBKDF2_ITERATIONS = 600_000;   // OWASP guidance for PBKDF2-HMAC-SHA256
+const BACKUP_SALT_BYTES = 16;
+
+async function deriveBackupKey(password, salt, iterations, usages) {
+  const base = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    usages
+  );
+}
+
+/** Encrypt the private key under the password. Returns an opaque, storable blob. */
+export async function wrapPrivateKey(privateKey, password) {
+  if (!privateKey || privateKey.length !== ML_KEM_768_SECRET_KEY_BYTES) {
+    throw new Error('INVALID_PRIVATE_KEY');
+  }
+  if (typeof password !== 'string' || password.length === 0) throw new Error('EMPTY_PASSWORD');
+
+  const salt = crypto.getRandomValues(new Uint8Array(BACKUP_SALT_BYTES));
+  const key = await deriveBackupKey(password, salt, PBKDF2_ITERATIONS, ['encrypt']);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const sealed = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, privateKey)
+  );
+
+  return {
+    v: KEY_BACKUP_VERSION,
+    kdf: 'PBKDF2-SHA256',
+    iterations: PBKDF2_ITERATIONS,
+    salt: b64encode(salt),
+    nonce: b64encode(nonce),
+    ciphertext: b64encode(sealed.slice(0, -16)),
+    authTag: b64encode(sealed.slice(-16)),
+  };
+}
+
+/** Recover the private key from a backup blob. Throws if the password is wrong. */
+export async function unwrapPrivateKey(backup, password) {
+  if (!backup || backup.v !== KEY_BACKUP_VERSION) throw new Error('UNSUPPORTED_BACKUP');
+  if (typeof password !== 'string' || password.length === 0) throw new Error('EMPTY_PASSWORD');
+
+  try {
+    const salt = b64decode(backup.salt);
+    const key = await deriveBackupKey(password, salt, backup.iterations || PBKDF2_ITERATIONS, ['decrypt']);
+
+    const ct = b64decode(backup.ciphertext);
+    const tag = b64decode(backup.authTag);
+    const joined = new Uint8Array(ct.length + tag.length);
+    joined.set(ct);
+    joined.set(tag, ct.length);
+
+    const plain = new Uint8Array(
+      await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64decode(backup.nonce) }, key, joined)
+    );
+    if (plain.length !== ML_KEM_768_SECRET_KEY_BYTES) throw new Error('bad length');
+    return plain;
+  } catch {
+    // AES-GCM authentication failing is what a wrong password looks like.
+    throw new Error('WRONG_PASSWORD');
+  }
+}
+
+/* ─── Key identity ───
+   FIPS 203 encodes the decapsulation key as dk_PKE ‖ ek ‖ H(ek) ‖ z, so a
+   stored private key still carries its own public key. That lets the client
+   prove whether the key on this device is the one the account advertises —
+   the difference between "these messages are lost" and "this device is wrong". */
+
+export const ML_KEM_768_SECRET_KEY_BYTES = 2400;
+export const ML_KEM_768_PUBLIC_KEY_BYTES = 1184;
+const DK_PKE_BYTES = 1152;
+
+export function publicKeyFromSecretKey(secretKey) {
+  if (!secretKey || secretKey.length !== ML_KEM_768_SECRET_KEY_BYTES) return null;
+  return secretKey.slice(DK_PKE_BYTES, DK_PKE_BYTES + ML_KEM_768_PUBLIC_KEY_BYTES);
+}
+
+/** Short, human-comparable fingerprint of a public key. */
+export async function keyFingerprint(publicKey) {
+  if (!publicKey || publicKey.length === 0) return null;
+  const digest = await crypto.subtle.digest('SHA-256', publicKey);
+  return [...new Uint8Array(digest).slice(0, 8)]
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+    .toUpperCase()
+    .match(/.{4}/g)
+    .join(' ');
+}
+
 // Builds a rolling SHA-256 hash chain of the conversation history
 export async function calculateIntegrity(messages) {
   if (!messages || messages.length === 0) return '0x0000...';

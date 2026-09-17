@@ -1,14 +1,16 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { io } from 'socket.io-client';
 import { useNavigate } from 'react-router-dom';
 import api, { SOCKET_URL, clearSession } from '../lib/api';
-import { encryptForRecipients, decryptEnvelope, b64decode, calculateIntegrity } from '../crypto/encryption';
+import Logo from './visuals/Logo';
+import { useToast } from './visuals/Toast';
+import { encryptForRecipients, decryptEnvelope, b64decode, calculateIntegrity, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Send, Terminal, LogOut, Lock, Fingerprint,
-  Users, Zap, ShieldCheck, Trash2, Video, PhoneOff, Mic, MicOff, VideoOff, Check, CheckCheck,
+  Users, Zap, Trash2, Video, PhoneOff, Mic, MicOff, VideoOff, Check, CheckCheck,
   Paperclip, X, Reply, Smile, File, StopCircle, Trash, Download,
-  Copy, UserPlus, Search, Loader2
+  Copy, UserPlus, Search, Loader2, Menu, KeyRound, ShieldAlert, ArrowDown
 } from 'lucide-react';
 
 /* ─── Avatar palette ─── */
@@ -21,15 +23,46 @@ const GRADIENTS = [
 ];
 const avatarGrad = (name = '') => GRADIENTS[(name.charCodeAt(0) || 0) % GRADIENTS.length];
 
+/* ─── Day separators ─── */
+const dayKey = (ts) => new Date(ts).toDateString();
+const dayLabel = (ts) => {
+  const d = new Date(ts);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'Today';
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString([], {
+    day: 'numeric',
+    month: 'short',
+    ...(d.getFullYear() === today.getFullYear() ? {} : { year: 'numeric' }),
+  });
+};
+
 /* ─── Format timestamp ─── */
 const fmt = ts => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const formatLastSeen = ts => {
   if (!ts) return '';
   const d = new Date(ts);
-  const today = new Date();
-  if (d.toDateString() === today.toDateString()) return `Last seen today at ${fmt(ts)}`;
-  return `Last seen ${d.toLocaleDateString()} at ${fmt(ts)}`;
+  const now = new Date();
+  const mins = Math.round((now - d) / 60000);
+
+  if (mins < 1)  return 'Active just now';
+  if (mins < 60) return `Active ${mins}m ago`;
+
+  const midnight = new Date(now); midnight.setHours(0, 0, 0, 0);
+  const days = Math.floor((midnight - d) / 86400000) + 1;
+
+  if (days <= 0) return `Last seen today at ${fmt(ts)}`;
+  if (days === 1) return `Last seen yesterday at ${fmt(ts)}`;
+  if (days < 7)  return `Last seen ${d.toLocaleDateString(undefined, { weekday: 'long' })} at ${fmt(ts)}`;
+  return `Last seen ${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
 };
+
+/** Group a digest into 4-char blocks so the eye can actually compare two of them. */
+const formatDigest = (hex, blocks = 2) =>
+  (hex || '').toUpperCase().replace(/[^0-9A-Z]/gi, '').slice(0, blocks * 4)
+    .match(/.{1,4}/g)?.join(' ') || '';
 
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢'];
 
@@ -103,9 +136,19 @@ const previewText = (m) => {
 
 export default function ChatDashboard() {
   const navigate = useNavigate();
-  const currentUser   = JSON.parse(localStorage.getItem('qchat_user') || '{}');
+  const toast = useToast();
+  // These are read from localStorage on every render, so they MUST be memoised:
+  // an unmemoised `privateKey` is a fresh Uint8Array each render, and any effect
+  // that lists it as a dependency re-fires forever (infinite render loop).
+  const currentUser   = useMemo(
+    () => JSON.parse(localStorage.getItem('qchat_user') || '{}'),
+    [],
+  );
   const privateKeyB64 = currentUser.id ? localStorage.getItem(`qchat_priv_${currentUser.id}`) : null;
-  const privateKey    = privateKeyB64 ? b64decode(privateKeyB64) : null;
+  const privateKey    = useMemo(
+    () => (privateKeyB64 ? b64decode(privateKeyB64) : null),
+    [privateKeyB64],
+  );
 
   const socketRef = useRef(null);
   const [users, setUsers]               = useState([]);
@@ -114,7 +157,10 @@ export default function ChatDashboard() {
   const [input, setInput]               = useState('');
   const [logs, setLogs]                 = useState([]);
   const [encrypting, setEncrypting]     = useState(false);
-  const [showConsole, setShowConsole]   = useState(true);
+  // The protocol console eats 144px — worth it on a desktop, not on a phone.
+  const [showConsole, setShowConsole]   = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1024);
+  // Below lg the sidebar is a drawer rather than a permanent column.
+  const [sidebarOpen, setSidebarOpen]   = useState(false);
   const [integrity, setIntegrity]       = useState(null);
   const [connStatus, setConnStatus]     = useState('connecting');
   
@@ -128,6 +174,8 @@ export default function ChatDashboard() {
   // Contact discovery: you only see people you've added (plus anyone who has
   // messaged you), so the sidebar is no longer a directory of every account.
   const [myProfile, setMyProfile] = useState(null);
+  // Is the key on this device actually the one the account advertises?
+  const [keyStatus, setKeyStatus] = useState(null);
   const [copied, setCopied]       = useState(false);
   const [showAdd, setShowAdd]     = useState(false);
   const [addQuery, setAddQuery]   = useState('');
@@ -139,6 +187,7 @@ export default function ChatDashboard() {
   // reader down, and also stops a new message doing it while they read back.
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingOlder, setLoadingOlder]     = useState(false);
+  const [atBottom, setAtBottom]             = useState(true);
   const scrollBoxRef      = useRef(null);
   const stickToBottomRef  = useRef(true);
   const loadingOlderRef   = useRef(false);
@@ -167,6 +216,7 @@ export default function ChatDashboard() {
   /* Persist selected peer across refreshes */
   const selectPeer = (u) => {
     setPeer(u);
+    setSidebarOpen(false);
     setReplyingTo(null);
     setReactionPickerFor(null);
     setAttachment(null);
@@ -428,6 +478,27 @@ export default function ChatDashboard() {
       .catch(err => addLog(`Could not load your profile: ${err.message}`, 'pink'));
   }, []);
 
+  /* Compare this device's private key against the public key the server holds
+     for us. A mismatch is the real reason old messages stop opening, and it is
+     worth saying precisely rather than showing a generic failure. */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!privateKey) { if (!cancelled) setKeyStatus({ state: 'missing' }); return; }
+
+      const derived = publicKeyFromSecretKey(privateKey);
+      if (!derived) { if (!cancelled) setKeyStatus({ state: 'invalid' }); return; }
+
+      const mine = await keyFingerprint(derived);
+      const serverKey = myProfile?.public_key;
+      if (!serverKey) { if (!cancelled) setKeyStatus({ state: 'ok', mine }); return; }
+
+      const server = await keyFingerprint(b64decode(serverKey));
+      if (!cancelled) setKeyStatus({ state: mine === server ? 'ok' : 'mismatch', mine, server });
+    })().catch(() => { if (!cancelled) setKeyStatus(null); });
+    return () => { cancelled = true; };
+  }, [privateKey, myProfile]);
+
   /* Dismiss the reaction picker on an outside click or Escape. */
   useEffect(() => {
     if (!reactionPickerFor) return;
@@ -564,7 +635,9 @@ export default function ChatDashboard() {
     });
 
     s.on('message_error', ({ tempId, error }) => {
-      addLog(`Message rejected: ${error}`, 'pink');
+      toast.error(error === 'PAYLOAD_TOO_LARGE'
+        ? 'That attachment was too large to send.'
+        : 'Your message could not be sent.');
       setMessages(prev => prev.map(m =>
         String(m.id) === String(tempId)
           ? { ...m, error: true, text: error === 'PAYLOAD_TOO_LARGE' ? '[Not sent — attachment too large]' : '[Not sent]' }
@@ -756,8 +829,16 @@ export default function ChatDashboard() {
 
   const handleMessagesScroll = (e) => {
     const box = e.currentTarget;
-    stickToBottomRef.current = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    stickToBottomRef.current = nearBottom;
+    setAtBottom(nearBottom);
     if (box.scrollTop < 80) loadOlderMessages();
+  };
+
+  const jumpToLatest = () => {
+    stickToBottomRef.current = true;
+    setAtBottom(true);
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
   const handleTyping = (e) => {
@@ -776,7 +857,9 @@ export default function ChatDashboard() {
     const file = e.target.files[0];
     if (!file) return;
     // MVP limit to ~2MB because it goes into mongodb doc + socket payload encoded in base64.
-    if (file.size > 2 * 1024 * 1024) return alert('File too large (max 2MB for MVP).');
+    if (file.size > 2 * 1024 * 1024) {
+      return toast.error(`"${file.name}" is ${(file.size / 1024 / 1024).toFixed(1)}MB — the limit is 2MB.`);
+    }
     const reader = new FileReader();
     reader.onload = () => {
       // Audio picked from disk used to fall through to 'file' and render as an
@@ -865,9 +948,17 @@ export default function ChatDashboard() {
     }
   };
 
-  const deleteMessage = (messageId) => {
-    if (!isRealId(messageId)) return addLog('Still sending — try again in a moment', 'pink');
-    if (!window.confirm("Delete this message for everyone?")) return;
+  const deleteMessage = async (messageId) => {
+    if (!isRealId(messageId)) return toast.info('Still sending — try again in a moment.');
+
+    const ok = await toast.confirm({
+      title: 'Delete this message?',
+      body: 'It will be removed for both of you. This cannot be undone.',
+      confirmLabel: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+
     socketRef.current?.emit('delete_message', { messageId });
     setMessages(prev => prev.map(m => String(m.id) === String(messageId) ? { ...m, deleted: true, text: '', type: 'text' } : m));
   };
@@ -931,8 +1022,9 @@ export default function ChatDashboard() {
       await navigator.clipboard.writeText(myProfile.qchatId);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+      toast.success('QChat ID copied.');
     } catch {
-      addLog('Clipboard blocked by the browser — copy the ID manually', 'pink');
+      toast.error('Clipboard blocked by the browser — select and copy the ID manually.');
     }
   };
 
@@ -962,7 +1054,7 @@ export default function ChatDashboard() {
       setShowAdd(false);
       resetAddPanel();
       selectPeer({ ...data, id: String(data.id) });
-      addLog(`Added ${data.username} to contacts`, 'green');
+      toast.success(`${data.username} added to contacts.`);
     } catch (err) {
       setAddError(err.response?.data?.error || 'Could not add contact');
     } finally {
@@ -972,28 +1064,42 @@ export default function ChatDashboard() {
 
   const removeContact = async (u, e) => {
     e.stopPropagation();
-    if (!window.confirm(`Remove ${u.username} from your contacts?`)) return;
+
+    const ok = await toast.confirm({
+      title: `Remove ${u.username}?`,
+      body: 'They disappear from your contacts. Your messages are kept, and they reappear if they message you again.',
+      confirmLabel: 'Remove',
+      destructive: true,
+    });
+    if (!ok) return;
+
     try {
-      const { data } = await api.delete(`/api/users/contacts/${u.id}`);
-      if (data.stillVisible) {
-        addLog(`${u.username} stays listed — you still have message history`, 'info');
-      } else if (peerRef.current && String(peerRef.current.id) === String(u.id)) {
-        selectPeer(null);
-      }
+      await api.delete(`/api/users/contacts/${u.id}`);
+      if (peerRef.current && String(peerRef.current.id) === String(u.id)) selectPeer(null);
       await fetchUsers();
+      toast.success(`${u.username} removed from contacts.`);
     } catch (err) {
-      addLog(`Could not remove contact: ${err.message}`, 'pink');
+      toast.error(`Could not remove contact: ${err.message}`);
     }
   };
 
   const clearChat = async () => {
     if (!peer) return;
-    if (!window.confirm(`Clear all messages with ${peer.username}?`)) return;
+
+    const ok = await toast.confirm({
+      title: `Clear your chat with ${peer.username}?`,
+      body: 'Every message in this conversation is deleted for both of you. This cannot be undone.',
+      confirmLabel: 'Clear chat',
+      destructive: true,
+    });
+    if (!ok) return;
+
     try {
       await api.delete(`/api/messages/${peer.id}`);
       setMessages([]); setIntegrity(null);
+      toast.success('Conversation cleared.');
     } catch (err) {
-      addLog(`Could not clear chat: ${err.message}`, 'pink');
+      toast.error(`Could not clear chat: ${err.message}`);
     }
   };
 
@@ -1088,6 +1194,48 @@ export default function ChatDashboard() {
     );
   };
 
+  /**
+   * Flatten messages into render rows, inserting day separators and collapsing
+   * consecutive unreadable messages. A run of twenty red bubbles reads as
+   * twenty failures; it is one fact, stated once.
+   */
+  const renderRows = React.useMemo(() => {
+    const rows = [];
+    let locked = [];
+    let lastDay = null;
+
+    const flushLocked = () => {
+      if (locked.length === 0) return;
+      rows.push({ kind: 'locked', count: locked.length, key: `locked-${locked[0].id}` });
+      locked = [];
+    };
+
+    for (const msg of messages) {
+      const key = dayKey(msg.timestamp);
+      if (key !== lastDay) {
+        flushLocked();
+        rows.push({ kind: 'day', label: dayLabel(msg.timestamp), key: `day-${key}` });
+        lastDay = key;
+      }
+      if (msg.error && !msg.deleted) { locked.push(msg); continue; }
+      flushLocked();
+      rows.push({ kind: 'msg', msg, key: msg.id });
+    }
+    flushLocked();
+
+    // Mark run boundaries so consecutive messages from one person read as a
+    // single block: only the last gets a tail corner, a timestamp and an avatar.
+    rows.forEach((row, i) => {
+      if (row.kind !== 'msg') return;
+      const prev = rows[i - 1];
+      const next = rows[i + 1];
+      row.groupStart = !(prev?.kind === 'msg' && prev.msg.isMine === row.msg.isMine);
+      row.groupEnd   = !(next?.kind === 'msg' && next.msg.isMine === row.msg.isMine);
+    });
+
+    return rows;
+  }, [messages]);
+
   const renderReactions = (msg) => {
     const reactions = msg.reactions || [];
     if (reactions.length === 0) return null;
@@ -1121,22 +1269,41 @@ export default function ChatDashboard() {
   };
 
   return (
-    <div className="relative h-screen flex overflow-hidden bg-navy-950">
+    <div className="relative h-[100dvh] flex overflow-hidden bg-navy-950">
       <div className="bg-grid" />
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
         <div className="orb w-[700px] h-[700px] bg-blue-900/20 -top-60 -left-40" />
         <div className="orb w-[500px] h-[500px] bg-indigo-900/15 -bottom-40 -right-20" style={{ animationDelay: '-9s' }} />
       </div>
 
-      <aside className="relative z-10 w-72 flex flex-col m-3 mr-0 glass flex-shrink-0">
+      {/* Backdrop for the mobile drawer */}
+      {sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          className="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm lg:hidden"
+          aria-hidden="true"
+        />
+      )}
+
+      <aside
+        className={`fixed lg:relative inset-y-0 left-0 z-40 w-72 max-w-[85vw] flex flex-col flex-shrink-0
+                    glass !rounded-none lg:!rounded-2xl m-0 lg:m-3 lg:mr-0
+                    transition-transform duration-300 ease-out
+                    ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0`}
+      >
         <div className="flex items-center justify-between px-5 pt-5 pb-4 border-b border-white/[0.06]">
           <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-500 flex items-center justify-center shadow-glow-cyan-sm">
-              <ShieldCheck size={15} className="text-navy-950" />
-            </div>
+            <Logo size={32} />
             <span className="font-extrabold text-sm tracking-tight">QChat</span>
           </div>
-          <span className="badge-pq"><Zap size={9} />PQ-Secure</span>
+          <span className="badge-pq hidden sm:inline-flex"><Zap size={9} />PQ-Secure</span>
+          <button
+            onClick={() => setSidebarOpen(false)}
+            className="lg:hidden p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5"
+            aria-label="Close contacts"
+          >
+            <X size={16} />
+          </button>
         </div>
         {/* The ID you hand out so people can find you */}
         <div className="mx-3 mt-3 px-3 py-2 rounded-xl bg-white/[0.03] border border-white/[0.06]">
@@ -1154,6 +1321,14 @@ export default function ChatDashboard() {
             </button>
           </div>
           <p className="text-[9px] text-slate-600 mt-1">Share this so others can add you</p>
+          {keyStatus?.mine && (
+            <div className="mt-2 pt-2 border-t border-white/[0.05] flex items-center gap-1.5">
+              <KeyRound size={9} className={keyStatus.state === 'ok' ? 'text-emerald-400' : 'text-amber-400'} />
+              <span className="text-[9px] font-mono text-slate-500 truncate" title="Fingerprint of this device's key">
+                {keyStatus.mine}
+              </span>
+            </div>
+          )}
         </div>
 
         <div className="px-5 pt-3 pb-2 flex items-center justify-between">
@@ -1228,10 +1403,26 @@ export default function ChatDashboard() {
               </p>
             </div>
           ) : users.map(u => (
+            // A div, not a button, because the remove control nests inside it and
+            // nested buttons are invalid. That costs keyboard access unless we
+            // put it back by hand.
             <div
               key={u.id}
+              role="button"
+              tabIndex={0}
+              aria-pressed={peer?.id === String(u.id)}
+              aria-label={`Chat with ${u.username}${u.qchatId ? `, ${u.qchatId}` : ''}`}
+              title={u.qchatId || u.username}
               onClick={() => selectPeer({ ...u, id: String(u.id) })}
-              className={`user-row w-full text-left group/row ${peer?.id === String(u.id) ? 'active' : ''}`}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  selectPeer({ ...u, id: String(u.id) });
+                }
+              }}
+              className={`user-row w-full text-left group/row focus:outline-none focus-visible:ring-2
+                          focus-visible:ring-cyan-400/60 focus-visible:ring-offset-1 focus-visible:ring-offset-navy-900
+                          ${peer?.id === String(u.id) ? 'active' : ''}`}
             >
               <div className={`relative w-9 h-9 rounded-full bg-gradient-to-br ${avatarGrad(u.username)} flex items-center justify-center font-bold text-sm text-white flex-shrink-0`}>
                 {u.username[0].toUpperCase()}
@@ -1239,7 +1430,13 @@ export default function ChatDashboard() {
               </div>
               <div className="min-w-0 flex-1">
                 <p className="font-semibold text-sm truncate">{u.username}</p>
-                <p className="text-[10px] font-mono text-slate-500 truncate">{u.qchatId || '—'}</p>
+                {u.isOnline ? (
+                  <p className="text-[10px] font-medium text-emerald-400/90 truncate">Online</p>
+                ) : u.lastSeen ? (
+                  <p className="text-[10px] text-slate-500 truncate">{formatLastSeen(u.lastSeen)}</p>
+                ) : (
+                  <p className="text-[10px] font-mono text-slate-500 truncate">{u.qchatId || '—'}</p>
+                )}
               </div>
               <button
                 type="button" onClick={(e) => removeContact(u, e)} title={`Remove ${u.username}`}
@@ -1265,18 +1462,30 @@ export default function ChatDashboard() {
         </div>
       </aside>
 
-      <main className="relative z-10 flex-1 flex flex-col m-3 glass overflow-hidden">
+      <main className="relative z-10 flex-1 min-w-0 flex flex-col glass !rounded-none lg:!rounded-2xl m-0 lg:m-3 overflow-hidden">
         {peer ? (
           <>
-            <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/[0.06] flex-shrink-0 gap-3">
-              <div className="flex items-center gap-3 min-w-0">
+            <div className="flex items-center justify-between px-3 sm:px-5 py-3 sm:py-3.5 border-b border-white/[0.06] flex-shrink-0 gap-2 sm:gap-3">
+              <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+                <button
+                  onClick={() => setSidebarOpen(true)}
+                  className="lg:hidden p-2 -ml-1 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 flex-shrink-0"
+                  aria-label="Open contacts"
+                >
+                  <Menu size={18} />
+                </button>
                 <div className={`relative w-9 h-9 rounded-full bg-gradient-to-br ${avatarGrad(peer.username)} flex items-center justify-center font-bold text-sm text-white flex-shrink-0`}>
                   {peer.username[0].toUpperCase()}
                 </div>
                 <div className="min-w-0">
                   <p className="font-bold text-base leading-tight truncate">{peer.username}</p>
                   {peerTyping ? (
-                    <p className="text-cyan-400 text-xs font-medium animate-pulse">typing...</p>
+                    <span className="flex items-center gap-1.5 text-cyan-400 text-xs font-medium">
+                      typing
+                      <span className="typing-dot !w-1 !h-1" />
+                      <span className="typing-dot !w-1 !h-1" style={{ animationDelay: '0.16s' }} />
+                      <span className="typing-dot !w-1 !h-1" style={{ animationDelay: '0.32s' }} />
+                    </span>
                   ) : peer.isOnline ? (
                     <p className="text-[10px] text-emerald-400 font-medium">Online</p>
                   ) : (
@@ -1285,12 +1494,38 @@ export default function ChatDashboard() {
                 </div>
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
-                {integrity && <span className="flex items-center gap-1 text-[10px] text-slate-500 font-mono mr-2"><Fingerprint size={10} className="text-cyan-400" />{integrity}</span>}
-                {callStatus === 'idle' && (
-                  <button onClick={startCall} className="btn-ghost p-2 rounded-lg text-emerald-400 hover:bg-emerald-400/10" title="Secure Video Call"><Video size={16} /></button>
+                {integrity && (
+                  <span
+                    title={`Transcript digest: ${integrity}\nEvery message in this thread hashes to this value. If it matches on both devices, neither transcript has been altered.`}
+                    className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wide
+                               text-emerald-300/90 bg-emerald-400/[0.08] border border-emerald-400/20
+                               px-2.5 py-1 rounded-full mr-1 cursor-default"
+                  >
+                    <Fingerprint size={11} className="text-emerald-400" />
+                    <span className="font-mono tracking-[0.08em]">{formatDigest(integrity)}</span>
+                  </span>
                 )}
-                <button className="btn-ghost p-2 rounded-lg text-slate-500 hover:text-rose-400" onClick={clearChat} title="Clear Chat"><Trash2 size={14} /></button>
-                <button className={`btn-ghost p-2 rounded-lg ${showConsole ? 'text-cyan-400' : ''}`} onClick={() => setShowConsole(v => !v)} title="Toggle Console"><Terminal size={14} /></button>
+
+                {/* One control group, one icon size — not three loose buttons. */}
+                <div className="flex items-center gap-0.5 bg-white/[0.03] border border-white/[0.06] rounded-xl p-1">
+                  {callStatus === 'idle' && (
+                    <button
+                      onClick={startCall} aria-label="Start secure video call" title="Secure video call"
+                      className="p-2 rounded-lg text-emerald-400 hover:bg-emerald-400/10 transition-colors"
+                    ><Video size={15} /></button>
+                  )}
+                  <button
+                    onClick={() => setShowConsole(v => !v)}
+                    aria-label="Toggle protocol console" aria-pressed={showConsole} title="Protocol console"
+                    className={`p-2 rounded-lg transition-colors ${showConsole
+                      ? 'text-cyan-300 bg-cyan-400/10'
+                      : 'text-slate-500 hover:text-white hover:bg-white/[0.06]'}`}
+                  ><Terminal size={15} /></button>
+                  <button
+                    onClick={clearChat} aria-label="Clear this conversation" title="Clear conversation"
+                    className="p-2 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-400/10 transition-colors"
+                  ><Trash2 size={15} /></button>
+                </div>
               </div>
             </div>
 
@@ -1333,8 +1568,8 @@ export default function ChatDashboard() {
               )}
             </AnimatePresence>
 
-            <div ref={scrollBoxRef} onScroll={handleMessagesScroll} className="flex-1 overflow-y-auto px-4 py-5" style={{ backgroundImage: "url('/whatsapp-bg.png')", backgroundSize: 'cover', backgroundBlendMode: 'overlay', backgroundColor: 'rgba(10,15,30,0.92)' }}>
-              <div className="flex flex-col gap-3">
+            <div ref={scrollBoxRef} onScroll={handleMessagesScroll} className="chat-canvas flex-1 overflow-y-auto px-3 sm:px-4 py-4 sm:py-5">
+              <div className="flex flex-col gap-3 min-h-full justify-end">
                 {loadingOlder && (
                   <div className="flex items-center justify-center gap-2 py-2 text-[10px] text-slate-500">
                     <Loader2 size={11} className="animate-spin" /> Loading older messages…
@@ -1348,61 +1583,218 @@ export default function ChatDashboard() {
                     Load older messages
                   </button>
                 )}
+                {keyStatus && keyStatus.state !== 'ok' && (
+                  <div className="mx-auto mb-2 max-w-lg glass-sm !border-amber-500/25 p-4 flex items-start gap-3">
+                    <ShieldAlert size={16} className="text-amber-400 flex-shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      {keyStatus.state === 'missing' && (
+                        <>
+                          <p className="text-[13px] font-semibold text-amber-300 mb-1">No private key on this device</p>
+                          <p className="text-xs text-sub leading-relaxed">
+                            Nothing can be decrypted here. Sign out and back in to generate a
+                            keypair — anything sent to your previous key stays unreadable.
+                          </p>
+                        </>
+                      )}
+
+                      {keyStatus.state === 'mismatch' && (
+                        <>
+                          <p className="text-[13px] font-semibold text-amber-300 mb-1">This device holds a different key</p>
+                          <p className="text-xs text-sub leading-relaxed mb-2.5">
+                            Your account advertises one public key, but this browser stores a
+                            different one — so messages encrypted to the account key cannot be
+                            opened here. This happens when a keypair is regenerated, which
+                            signing in without a stored key will do.
+                          </p>
+                          <div className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-[11px] font-mono">
+                            <span className="text-slate-500">this device</span>
+                            <span className="text-slate-300">{keyStatus.mine}</span>
+                            <span className="text-slate-500">account</span>
+                            <span className="text-slate-300">{keyStatus.server}</span>
+                          </div>
+                        </>
+                      )}
+
+                      {keyStatus.state === 'invalid' && (
+                        <>
+                          <p className="text-[13px] font-semibold text-amber-300 mb-1">Stored key is unreadable</p>
+                          <p className="text-xs text-sub leading-relaxed">
+                            The private key in this browser is not a valid ML-KEM-768 key.
+                            Sign out and back in to generate a fresh one.
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {!hasMoreHistory && messages.length > 0 && (
                   <div className="text-center text-[10px] text-slate-600 py-1">
                     Beginning of your encrypted conversation
                   </div>
                 )}
+
+                {messages.length === 0 && !loadingOlder && (
+                  <div className="flex flex-col items-center justify-center py-16 text-center">
+                    <Logo size={44} className="mb-4 opacity-30" withGlow={false} />
+                    <p className="text-sm text-slate-400 font-medium">No messages yet</p>
+                    <p className="text-xs text-slate-600 mt-1.5 max-w-[15rem] leading-relaxed">
+                      Say something to {peer.username}. It is encrypted on this device before it leaves.
+                    </p>
+                  </div>
+                )}
                 <AnimatePresence initial={false}>
-                  {messages.map((msg, i) => {
-                    const isGrouped = i > 0 && messages[i - 1].isMine === msg.isMine;
-                    return (
-                      <motion.div id={`msg-${msg.id}`} key={msg.id || i} className={`flex items-end gap-2 group ${msg.isMine ? 'justify-end' : 'justify-start'} ${isGrouped ? 'mt-0.5' : 'mt-2'}`} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
-                        
-                        {/* Hover actions (Theirs) */}
-                        {!msg.isMine && !msg.deleted && (
-                          <div data-reaction-ui className={`flex items-center gap-1 transition-opacity mb-2 focus-within:opacity-100 ${reactionPickerFor === msg.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
-                            <button type="button" aria-label="Reply" title="Reply" onClick={() => setReplyingTo(msg)} className="p-2 text-slate-400 hover:text-white hover:bg-navy-700 rounded-full bg-navy-800 transition-colors"><Reply size={14}/></button>
-                            {renderReactionButton(msg, 'left')}
-                          </div>
-                        )}
+                  {renderRows.map((row, i) => {
+                    if (row.kind === 'day') {
+                      return (
+                        <div key={row.key} className="sticky top-1 z-20 flex items-center justify-center my-3 pointer-events-none">
+                          <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400
+                                           bg-navy-900/90 backdrop-blur-md border border-white/[0.08]
+                                           shadow-lg shadow-black/30 px-3 py-1 rounded-full">
+                            {row.label}
+                          </span>
+                        </div>
+                      );
+                    }
 
-                        <div className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`} style={{ maxWidth: '68%' }}>
-                          <div className={[msg.isMine ? 'bubble-mine' : 'bubble-theirs', msg.error ? 'bubble-error' : ''].filter(Boolean).join(' ')}>
-                            {renderBubbleContent(msg)}
-                          </div>
-                          
-                          {renderReactions(msg)}
-
-                          <div className={`flex items-center gap-1 px-1 ${msg.reactions?.length ? 'mt-3' : 'mt-1'}`}>
-                            <span className="text-[10px] text-muted font-mono">{fmt(msg.timestamp)}</span>
-                            {msg.isMine && !msg.deleted && (
-                              msg.read ? <CheckCheck size={12} className="text-blue-400" /> :
-                              msg.delivered ? <CheckCheck size={12} className="text-slate-400" /> :
-                              <Check size={12} className="text-slate-500" />
-                            )}
+                    if (row.kind === 'locked') {
+                      return (
+                        <div key={row.key} className="flex items-center justify-center my-2">
+                          <div
+                            className="flex items-center gap-2 text-[11px] text-slate-500 bg-white/[0.03] border border-white/[0.07] px-3 py-1.5 rounded-full"
+                            title="These were encrypted to a key this device no longer holds. Generating a new keypair — by signing in on a new device or after clearing site data — makes older messages unreadable here."
+                          >
+                            <KeyRound size={11} className="text-slate-500" />
+                            {row.count === 1 ? '1 message' : `${row.count} messages`} encrypted to an earlier key
                           </div>
                         </div>
+                      );
+                    }
 
-                        {/* Hover actions (Mine) */}
-                        {msg.isMine && !msg.deleted && (
-                          <div data-reaction-ui className={`flex items-center gap-1 transition-opacity mb-2 focus-within:opacity-100 ${reactionPickerFor === msg.id ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
-                            {renderReactionButton(msg, 'right')}
-                            <button type="button" aria-label="Reply" title="Reply" onClick={() => setReplyingTo(msg)} className="p-2 text-slate-400 hover:text-white hover:bg-navy-700 rounded-full bg-navy-800 transition-colors"><Reply size={14}/></button>
-                            <button type="button" aria-label="Delete message" title="Delete" onClick={() => deleteMessage(msg.id)} className="p-2 text-slate-400 hover:text-rose-400 hover:bg-navy-700 rounded-full bg-navy-800 transition-colors"><Trash2 size={14}/></button>
-                          </div>
+                    const msg = row.msg;
+                    const isGrouped = !row.groupStart;
+
+                    // Hover actions, built once and placed inboard of the bubble on
+                    // either side, so they never collide with the window edge.
+                    const actions = msg.deleted || msg.error ? null : (
+                      <div
+                        data-reaction-ui
+                        className={`flex items-center gap-1 self-center transition-opacity duration-150 ${
+                          reactionPickerFor === msg.id
+                            ? 'opacity-100'
+                            : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'
+                        }`}
+                      >
+                        {msg.isMine && (
+                          <button
+                            type="button"
+                            title="Delete message"
+                            aria-label="Delete message"
+                            onClick={() => deleteMessage(msg.id)}
+                            className="p-2 rounded-full bg-navy-800 text-slate-400 hover:text-rose-400 hover:bg-navy-700 transition-colors"
+                          >
+                            <Trash size={14} />
+                          </button>
                         )}
+                        {renderReactionButton(msg, msg.isMine ? 'right' : 'left')}
+                        <button
+                          type="button"
+                          title="Reply"
+                          aria-label="Reply to message"
+                          onClick={() => setReplyingTo(msg)}
+                          className="p-2 rounded-full bg-navy-800 text-slate-400 hover:text-white hover:bg-navy-700 transition-colors"
+                        >
+                          <Reply size={14} />
+                        </button>
+                      </div>
+                    );
+
+                    return (
+                      <motion.div
+                        id={`msg-${msg.id}`}
+                        key={row.key || i}
+                        className={`flex items-end gap-2 group ${msg.isMine ? 'justify-end' : 'justify-start'} ${isGrouped ? 'mt-0.5' : 'mt-3'}`}
+                        initial={{ opacity: 0, y: 8, x: msg.isMine ? 10 : -10 }}
+                        animate={{ opacity: 1, y: 0, x: 0 }}
+                        transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+                      >
+                        
+                        {/* Avatar anchors the end of a received run */}
+                        {!msg.isMine && (
+                          row.groupEnd ? (
+                            <div className={`w-7 h-7 rounded-full bg-gradient-to-br ${avatarGrad(peer.username)} flex items-center justify-center text-[11px] font-bold text-white flex-shrink-0 self-end mb-1`}>
+                              {peer.username[0].toUpperCase()}
+                            </div>
+                          ) : <div className="w-7 flex-shrink-0" aria-hidden="true" />
+                        )}
+
+                        {/* Your own actions sit inboard of the bubble, not at the screen edge */}
+                        {msg.isMine && actions}
+
+                        <div className={`flex flex-col max-w-[82%] sm:max-w-[68%] ${msg.isMine ? 'items-end' : 'items-start'}`}>
+                          <div className={[
+                            msg.isMine ? 'bubble-mine' : 'bubble-theirs',
+                            row.groupEnd ? (msg.isMine ? 'bubble-tail-mine' : 'bubble-tail-theirs') : '',
+                            msg.error ? 'bubble-error' : '',
+                          ].filter(Boolean).join(' ')}>
+                            {renderBubbleContent(msg)}
+                          </div>
+
+                          {renderReactions(msg)}
+
+                          {row.groupEnd && (
+                            <div className={`flex items-center gap-1 px-1 ${msg.reactions?.length ? 'mt-3' : 'mt-1'}`}>
+                              <span className="text-[10px] text-muted font-mono">{fmt(msg.timestamp)}</span>
+                              {msg.isMine && !msg.deleted && (
+                                msg.read ? <CheckCheck size={12} className="text-cyan-400" /> :
+                                msg.delivered ? <CheckCheck size={12} className="text-slate-400" /> :
+                                <Check size={12} className="text-slate-500" />
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {!msg.isMine && actions}
 
                       </motion.div>
                     );
                   })}
                 </AnimatePresence>
+                {peerTyping && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
+                    className="flex items-end gap-2 justify-start mt-3"
+                  >
+                    <div className={`w-7 h-7 rounded-full bg-gradient-to-br ${avatarGrad(peer.username)} flex items-center justify-center text-[11px] font-bold text-white flex-shrink-0`}>
+                      {peer.username[0].toUpperCase()}
+                    </div>
+                    <div className="bubble-theirs bubble-tail-theirs flex items-center gap-1 !py-3">
+                      <span className="typing-dot" />
+                      <span className="typing-dot" style={{ animationDelay: '0.16s' }} />
+                      <span className="typing-dot" style={{ animationDelay: '0.32s' }} />
+                    </div>
+                  </motion.div>
+                )}
+
                 <div ref={bottomRef} />
               </div>
             </div>
 
+            <AnimatePresence>
+              {!atBottom && (
+                <motion.button
+                  type="button" onClick={jumpToLatest}
+                  initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}
+                  className="jump-latest"
+                  style={{ bottom: showConsole ? '13.5rem' : '5.75rem' }}
+                >
+                  <ArrowDown size={12} /> Jump to latest
+                </motion.button>
+              )}
+            </AnimatePresence>
+
             {/* Input Area */}
-            <div className="relative px-4 py-3.5 border-t border-white/[0.06] flex-shrink-0 bg-navy-950/70 backdrop-blur-md z-10">
+            <div className="relative px-3 sm:px-4 py-3 sm:py-3.5 border-t border-white/[0.06] flex-shrink-0 bg-navy-950/70 backdrop-blur-md z-10 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
               
               {replyingTo && (
                 <div className="mb-2 flex items-center justify-between bg-black/40 p-2 rounded-lg border-l-4 border-emerald-400">
@@ -1430,21 +1822,27 @@ export default function ChatDashboard() {
                   <Paperclip size={20} />
                 </button>
                 
-                <input ref={inputRef} className="field-input flex-1 !rounded-full !py-2.5 !px-5 !mb-0 bg-navy-900 border-white/10 focus:border-emerald-400/50 transition-colors" 
+                <input ref={inputRef} className="field-input flex-1 !rounded-full !py-2.5 !px-5 !mb-0 bg-navy-900 border-white/10 transition-colors" 
                        type="text" placeholder={attachment ? "Add a caption..." : "Type a message..."} 
                        value={input} onChange={handleTyping} onKeyDown={handleKeyDown} disabled={encrypting || isRecording} autoComplete="off" />
                 
                 {input.trim() || attachment ? (
-                  <button type="submit" className="w-10 h-10 rounded-full bg-emerald-500 hover:bg-emerald-600 flex items-center justify-center text-white shadow-lg shadow-emerald-500/20 transition-transform hover:scale-105" disabled={encrypting}>
-                    <Send size={18} className="ml-0.5" />
-                  </button>
+                  <motion.button
+                    type="submit" disabled={encrypting}
+                    initial={{ scale: 0.85, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+                    transition={{ type: 'spring', stiffness: 500, damping: 24 }}
+                    whileTap={{ scale: 0.92 }}
+                    className="w-10 h-10 rounded-full bg-gradient-to-br from-cyan-400 to-blue-500 flex items-center justify-center text-navy-950 shadow-glow-cyan-sm hover:shadow-glow-cyan transition-shadow flex-shrink-0 disabled:opacity-50"
+                  >
+                    <Send size={17} className="ml-0.5" />
+                  </motion.button>
                 ) : isRecording ? (
                   <button type="button" onClick={stopRecording} className="w-10 h-10 rounded-full bg-rose-500 hover:bg-rose-600 flex items-center justify-center text-white shadow-lg shadow-rose-500/20 animate-pulse">
                     <StopCircle size={20} />
                   </button>
                 ) : (
-                  <button type="button" onClick={startRecording} className="w-10 h-10 rounded-full bg-navy-800 hover:bg-navy-700 flex items-center justify-center text-slate-300 transition-transform hover:scale-105">
-                    <Mic size={20} />
+                  <button type="button" onClick={startRecording} aria-label="Record a voice note" className="w-10 h-10 rounded-full bg-navy-800 hover:bg-navy-700 hover:text-cyan-300 flex items-center justify-center text-slate-300 transition-all hover:scale-105 flex-shrink-0">
+                    <Mic size={19} />
                   </button>
                 )}
               </form>
@@ -1467,9 +1865,15 @@ export default function ChatDashboard() {
             </AnimatePresence>
           </>
         ) : (
-          <div className="h-full flex flex-col items-center justify-center">
-            <div className="w-16 h-16 rounded-2xl bg-white/5 flex items-center justify-center mb-4"><ShieldCheck size={32} className="text-slate-600"/></div>
-            <p className="text-sm text-slate-400">Select a peer to start a quantum-secure chat</p>
+          <div className="h-full flex flex-col items-center justify-center px-6 text-center">
+            <Logo size={56} className="mb-4 opacity-40" withGlow={false} />
+            <p className="text-sm text-slate-400">Select a contact to start a quantum-secure chat</p>
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="btn-ghost mt-5 lg:hidden"
+            >
+              <Menu size={14} /> Open contacts
+            </button>
           </div>
         )}
       </main>

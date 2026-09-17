@@ -41,3 +41,26 @@ export function approximateSize(value) {
     return Infinity;
   }
 }
+
+export const MAX_KEY_BACKUP_BYTES = 16 * 1024;
+
+/**
+ * The backup is ciphertext the server can't inspect, so validation is limited
+ * to shape and size — enough to reject junk without pretending to understand it.
+ */
+export function validateKeyBackup(backup) {
+  if (backup === null || backup === undefined) return null;   // optional
+  if (typeof backup !== 'object' || Array.isArray(backup)) return 'Key backup must be an object';
+  if (backup.v !== 1) return 'Unsupported key backup version';
+
+  for (const field of ['salt', 'nonce', 'ciphertext', 'authTag']) {
+    if (typeof backup[field] !== 'string' || backup[field].length === 0) {
+      return `Key backup is missing ${field}`;
+    }
+  }
+  if (!Number.isInteger(backup.iterations) || backup.iterations < 100000) {
+    return 'Key backup KDF iteration count is too low';
+  }
+  if (approximateSize(backup) > MAX_KEY_BACKUP_BYTES) return 'Key backup is too large';
+  return null;
+}

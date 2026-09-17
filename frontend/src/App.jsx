@@ -1,5 +1,7 @@
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { ToastProvider } from './components/visuals/Toast';
+import Landing from './components/Landing';
 import Login from './components/Login';
 import Register from './components/Register';
 import ChatDashboard from './components/ChatDashboard';
@@ -12,7 +14,8 @@ function PrivateRoute({ children }) {
 
 function App() {
   return (
-    <Router>
+    <ToastProvider>
+      <Router>
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
@@ -20,9 +23,11 @@ function App() {
           path="/chat"
           element={<PrivateRoute><ChatDashboard /></PrivateRoute>}
         />
-        <Route path="/" element={<Navigate to="/chat" replace />} />
+        <Route path="/" element={<Landing />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </Router>
+      </Router>
+    </ToastProvider>
   );
 }
 

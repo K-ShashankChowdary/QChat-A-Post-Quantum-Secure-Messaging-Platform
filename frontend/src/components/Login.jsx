@@ -1,16 +1,24 @@
 import React, { useState } from 'react';
 import api from '../lib/api';
 import { useNavigate } from 'react-router-dom';
-import { generateKeyPair, b64encode } from '../crypto/encryption';
+import {
+  generateKeyPair, b64encode, b64decode,
+  wrapPrivateKey, unwrapPrivateKey, publicKeyFromSecretKey,
+} from '../crypto/encryption';
+import { useToast } from './visuals/Toast';
+import LatticeField from './visuals/LatticeField';
+import Logo from './visuals/Logo';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ShieldAlert, Loader2, Lock, AlertTriangle } from 'lucide-react';
+import { Loader2, Lock } from 'lucide-react';
 
 export default function Login() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [stage, setStage] = useState('');
   const [error, setError] = useState('');
   const navigate = useNavigate();
+  const toast = useToast();
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -21,42 +29,92 @@ export default function Login() {
       localStorage.setItem('qchat_token', data.token);
       localStorage.setItem('qchat_user', JSON.stringify(data.user));
 
-      // Use persistent local storage for keys so they survive tab closures and account switching
       const privKeyName = `qchat_priv_${data.user.id}`;
       const pubKeyName  = `qchat_pub_${data.user.id}`;
       const existingPriv = localStorage.getItem(privKeyName);
       const existingPub  = localStorage.getItem(pubKeyName);
 
-      if (!existingPriv || !existingPub) {
-        // First time login on this device — generate a fresh keypair
-        const kp = await generateKeyPair();
-        const pubB64 = b64encode(kp.publicKey);
-        localStorage.setItem(privKeyName, b64encode(kp.privateKey));
-        localStorage.setItem(pubKeyName, pubB64);
-        sessionStorage.removeItem('qchat_last_peer'); // clear last peer for fresh setup
-        
-        await api.post('/api/auth/update-key', { userId: data.user.id, publicKey: pubB64 });
-        localStorage.setItem('qchat_user', JSON.stringify({ ...data.user, publicKey: pubB64 }));
-      } else {
-        // We already have a persistent key on this device! 
-        // Force the backend to use THIS device's public key (in case they logged in elsewhere recently)
+      let publicKeyB64;
+
+      if (data.keyBackup) {
+        // The account has an encrypted backup, so that key IS the account key —
+        // recover it rather than minting a replacement. This is what makes the
+        // keypair per-user instead of per-browser.
+        setStage('Recovering your key…');
+        const restored = await unwrapPrivateKey(data.keyBackup, password);
+        publicKeyB64 = b64encode(publicKeyFromSecretKey(restored));
+
+        localStorage.setItem(privKeyName, b64encode(restored));
+        localStorage.setItem(pubKeyName, publicKeyB64);
+
+        if (data.user.publicKey !== publicKeyB64) {
+          await api.post('/api/auth/update-key', { userId: data.user.id, publicKey: publicKeyB64 });
+        }
+      } else if (existingPriv && existingPub) {
+        // Account predates backups but this device still holds the real key —
+        // upload a backup now so no future sign-in has to regenerate.
+        publicKeyB64 = existingPub;
+        setStage('Backing up your key…');
+        try {
+          const keyBackup = await wrapPrivateKey(b64decode(existingPriv), password);
+          await api.post('/api/auth/key-backup', { keyBackup });
+        } catch {
+          toast.info('Signed in, but your key could not be backed up this time.');
+        }
         if (data.user.publicKey !== existingPub) {
           await api.post('/api/auth/update-key', { userId: data.user.id, publicKey: existingPub });
         }
-        localStorage.setItem('qchat_user', JSON.stringify({ ...data.user, publicKey: existingPub }));
+      } else {
+        // No backup and no local key. Generating one is destructive: everything
+        // sealed to the old key becomes permanently unreadable. Say so first.
+        const proceed = await toast.confirm({
+          title: 'Create a new key for this device?',
+          body: 'This account has no key backup and this browser has no stored key. '
+              + 'Continuing generates a new keypair — any earlier messages will become '
+              + 'permanently unreadable. If you have another device with the key, sign in there instead.',
+          confirmLabel: 'Create new key',
+          destructive: true,
+        });
+
+        if (!proceed) {
+          localStorage.removeItem('qchat_token');
+          localStorage.removeItem('qchat_user');
+          setError('Sign-in cancelled — no new key was created.');
+          return;
+        }
+
+        setStage('Generating your key…');
+        const kp = await generateKeyPair();
+        publicKeyB64 = b64encode(kp.publicKey);
+        localStorage.setItem(privKeyName, b64encode(kp.privateKey));
+        localStorage.setItem(pubKeyName, publicKeyB64);
+        sessionStorage.removeItem('qchat_last_peer');
+
+        await api.post('/api/auth/update-key', { userId: data.user.id, publicKey: publicKeyB64 });
+        try {
+          const keyBackup = await wrapPrivateKey(kp.privateKey, password);
+          await api.post('/api/auth/key-backup', { keyBackup });
+        } catch { /* non-fatal; the next sign-in will retry */ }
       }
 
+      localStorage.setItem('qchat_user', JSON.stringify({ ...data.user, publicKey: publicKeyB64 }));
       navigate('/chat');
     } catch (err) {
-      setError(err.response?.data?.error || 'Login failed. Please try again.');
+      if (err.message === 'WRONG_PASSWORD') {
+        // Login succeeded, so the password is right — the blob itself is bad.
+        setError('Your key backup could not be opened. It may be corrupted; contact support or sign in on a device that still holds your key.');
+      } else {
+        setError(err.response?.data?.error || 'Login failed. Please try again.');
+      }
     } finally {
       setIsLoading(false);
+      setStage('');
     }
   };
 
   return (
     <div className="relative min-h-screen flex items-center justify-center p-6 overflow-hidden bg-navy-950">
-      <div className="bg-grid" />
+      <LatticeField className="fixed inset-0 w-full h-full z-0 pointer-events-none opacity-60" />
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
         <div className="orb w-[600px] h-[600px] bg-blue-900/30 -top-40 -left-20" />
         <div className="orb w-[500px] h-[500px] bg-cyan-900/20 -bottom-32 -right-16" style={{ animationDelay: '-7s' }} />
@@ -72,9 +130,7 @@ export default function Login() {
         <div className="glass p-10">
           {/* Logo */}
           <div className="flex items-center gap-3 mb-8">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-cyan-400 to-blue-500 flex items-center justify-center shadow-glow-cyan-sm flex-shrink-0">
-              <ShieldAlert size={20} className="text-navy-950" />
-            </div>
+            <Logo size={44} />
             <div>
               <p className="font-extrabold text-lg tracking-tight leading-none">QChat</p>
               <p className="text-[10px] text-slate-500 uppercase tracking-widest">Post-Quantum Secure</p>
@@ -91,7 +147,7 @@ export default function Login() {
                 onChange={e => setUsername(e.target.value)} required disabled={isLoading} autoComplete="username" />
             </div>
             <div>
-              <label className="block text-[11px] font-semibold uppercase tracking-widest text-muted mb-1.5">Passphrase</label>
+              <label className="block text-[11px] font-semibold uppercase tracking-widest text-muted mb-1.5">Password</label>
               <input className="field-input" type="password" placeholder="Your password" value={password}
                 onChange={e => setPassword(e.target.value)} required disabled={isLoading} autoComplete="current-password" />
             </div>
@@ -105,7 +161,7 @@ export default function Login() {
 
             <button type="submit" className="btn-primary w-full h-11" disabled={isLoading}>
               {isLoading
-                ? <><Loader2 size={15} className="animate-spin" />Authenticating...</>
+                ? <><Loader2 size={15} className="animate-spin" />{stage || 'Authenticating…'}</>
                 : <><Lock size={15} />Enter Secure Session</>
               }
             </button>

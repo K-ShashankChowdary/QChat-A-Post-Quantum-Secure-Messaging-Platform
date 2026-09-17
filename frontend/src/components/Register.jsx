@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import api from '../lib/api';
 import { useNavigate } from 'react-router-dom';
-import { generateKeyPair, b64encode } from '../crypto/encryption';
+import { generateKeyPair, b64encode, wrapPrivateKey } from '../crypto/encryption';
+import LatticeField from './visuals/LatticeField';
+import Logo from './visuals/Logo';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ShieldCheck, Loader2, Lock, CheckCircle2, Circle, Cpu } from 'lucide-react';
 
@@ -34,7 +36,7 @@ export default function Register() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (password.length < 8) { setError('Passphrase must be at least 8 characters'); return; }
+    if (password.length < 8) { setError('Password must be at least 8 characters'); return; }
     setError('');
     setActiveStep(0);
     setDoneSteps([]);
@@ -43,8 +45,12 @@ export default function Register() {
       const kp = await generateKeyPair();
       setSubmitting(true);
       const pubB64 = b64encode(kp.publicKey);
+      // Encrypted under the password so this exact key can be recovered on any
+      // other device, instead of that device generating a replacement and
+      // orphaning every message sent to this one.
+      const keyBackup = await wrapPrivateKey(kp.privateKey, password);
       const { data } = await api.post('/api/auth/register', {
-        username, password, publicKey: pubB64
+        username, password, publicKey: pubB64, keyBackup
       });
       
       // Store the private and public key persistently based on user ID
@@ -65,7 +71,7 @@ export default function Register() {
   return (
     <div className="relative min-h-screen flex items-center justify-center p-6 overflow-hidden bg-navy-950">
       {/* Background */}
-      <div className="bg-grid" />
+      <LatticeField className="fixed inset-0 w-full h-full z-0 pointer-events-none opacity-60" />
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
         <div className="orb w-[600px] h-[600px] bg-blue-900/30 -top-40 -left-20" />
         <div className="orb w-[500px] h-[500px] bg-cyan-900/20 -bottom-32 -right-16" style={{ animationDelay: '-7s' }} />
@@ -81,9 +87,7 @@ export default function Register() {
         <div className="glass p-10">
           {/* Logo */}
           <div className="flex items-center gap-3 mb-8">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-cyan-400 to-blue-500 flex items-center justify-center shadow-glow-cyan-sm flex-shrink-0">
-              <ShieldCheck size={20} className="text-navy-950" />
-            </div>
+            <Logo size={44} />
             <div>
               <p className="font-extrabold text-lg tracking-tight leading-none">QChat</p>
               <p className="text-[10px] text-slate-500 uppercase tracking-widest">Post-Quantum Secure</p>
@@ -100,9 +104,13 @@ export default function Register() {
                 onChange={e => setUsername(e.target.value)} required disabled={busy} autoComplete="username" />
             </div>
             <div>
-              <label className="block text-[11px] font-semibold uppercase tracking-widest text-muted mb-1.5">Passphrase</label>
+              <label className="block text-[11px] font-semibold uppercase tracking-widest text-muted mb-1.5">Password</label>
               <input className="field-input" type="password" placeholder="Min. 8 characters" value={password}
                 onChange={e => setPassword(e.target.value)} required disabled={busy} autoComplete="new-password" />
+              <p className="text-[10px] text-slate-600 mt-1.5 leading-relaxed">
+                This also encrypts the backup of your private key, so it is what lets you
+                read your messages on another device. Choose something strong — it cannot be reset.
+              </p>
             </div>
 
             <AnimatePresence>

@@ -27,10 +27,22 @@ const userSchema = new mongoose.Schema({
   // Shareable handle (QC-XXXX-XXXX). Random rather than derived from the
   // username, so accounts can't be found by guessing names.
   qchat_id:      { type: String, unique: true, sparse: true, index: true },
+  // The user's ML-KEM private key, encrypted under a key stretched from their
+  // password. Opaque here by construction — the server cannot open it, and
+  // stores it only so a new device can recover the account's original key
+  // instead of minting a new one and orphaning existing messages.
+  key_backup:    { type: Object, default: null },
   // People this user explicitly added. The contact list also surfaces anyone
   // they've exchanged messages with, so a first message reveals the sender
   // without needing a friend-request round trip.
   contacts:      [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  // Removing a contact you have history with can't just drop the contact link —
+  // the message-derived listing would put them straight back. Record when they
+  // were hidden; a message newer than that un-hides them.
+  hidden_contacts: [{
+    user:      { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    hidden_at: { type: Date, default: Date.now }
+  }],
   created_at:    { type: Date, default: Date.now },
   last_seen:     { type: Date, default: Date.now },
   is_online:     { type: Boolean, default: false }

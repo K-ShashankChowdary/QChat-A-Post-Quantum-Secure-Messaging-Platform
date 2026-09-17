@@ -26,6 +26,9 @@ export default {
         rose: {
           quantum: '#FF2D78',
         },
+        violet: {
+          quantum: '#8B5CF6',
+        },
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
@@ -39,6 +42,8 @@ export default {
         'glow-cyan': '0 0 20px rgba(0, 200, 255, 0.35)',
         'glow-cyan-sm': '0 0 10px rgba(0, 200, 255, 0.25)',
         'glow-green': '0 0 12px rgba(0, 255, 178, 0.4)',
+        'glow-violet': '0 0 28px rgba(139, 92, 246, 0.28)',
+        'glow-lift': '0 18px 50px -18px rgba(0, 200, 255, 0.35)',
       },
       keyframes: {
         drift: {
@@ -59,6 +64,18 @@ export default {
           '0%, 100%': { transform: 'scale(1)', opacity: '1' },
           '50%':       { transform: 'scale(1.5)', opacity: '0' },
         },
+        'gradient-pan': {
+          '0%, 100%': { backgroundPosition: '0% 50%' },
+          '50%':      { backgroundPosition: '100% 50%' },
+        },
+        float: {
+          '0%, 100%': { transform: 'translateY(0)' },
+          '50%':      { transform: 'translateY(-10px)' },
+        },
+        'sheen': {
+          '0%':   { transform: 'translateX(-120%) skewX(-18deg)' },
+          '100%': { transform: 'translateX(220%) skewX(-18deg)' },
+        },
       },
       animation: {
         drift:    'drift 18s ease-in-out infinite alternate',
@@ -66,6 +83,9 @@ export default {
         'fade-up':'fade-up 0.35s ease both',
         shimmer:  'shimmer 2.5s linear infinite',
         'ping2':  'ping2 1.4s ease-in-out infinite',
+        'gradient-pan': 'gradient-pan 7s ease infinite',
+        float:    'float 6s ease-in-out infinite',
+        sheen:    'sheen 2.4s ease-in-out infinite',
       },
     },
   },
