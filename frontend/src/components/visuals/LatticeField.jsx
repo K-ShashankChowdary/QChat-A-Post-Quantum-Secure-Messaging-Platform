@@ -35,6 +35,8 @@ export default function LatticeField({ className = '' }) {
     function build() {
       const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
       const rect = canvas.getBoundingClientRect();
+      // Nothing to build against yet — a later observer callback will redo it.
+      if (rect.width < 1 || rect.height < 1) return false;
       width = rect.width;
       height = rect.height;
 
@@ -60,6 +62,7 @@ export default function LatticeField({ className = '' }) {
           };
         }
       }
+      return true;
     }
 
     function draw() {
@@ -130,6 +133,7 @@ export default function LatticeField({ className = '' }) {
     }
 
     function start() {
+      if (!points.length) return;
       if (raf == null) raf = requestAnimationFrame(draw);
     }
     function stop() {
@@ -141,17 +145,21 @@ export default function LatticeField({ className = '' }) {
       pointerRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     };
     const onLeave = () => { pointerRef.current = { x: -9999, y: -9999 }; };
-    const onResize = () => { build(); };
+    const onResize = () => { rebuild(); };
+
+    const rebuild = () => {
+      const built = build();
+      if (!built) return;
+      if (reduced) { draw(); stop(); } else { start(); }
+    };
     // Don't burn frames on a tab nobody is looking at.
     const onVisibility = () => (document.hidden ? stop() : start());
 
-    build();
-    if (reduced) {
-      draw();
-      stop();
-    } else {
-      start();
-    }
+    rebuild();
+
+    // Watch the element itself, not just the window.
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(rebuild) : null;
+    ro?.observe(canvas);
 
     window.addEventListener('resize', onResize);
     window.addEventListener('pointermove', onPointer, { passive: true });
@@ -160,6 +168,7 @@ export default function LatticeField({ className = '' }) {
 
     return () => {
       stop();
+      ro?.disconnect();
       window.removeEventListener('resize', onResize);
       window.removeEventListener('pointermove', onPointer);
       window.removeEventListener('pointerleave', onLeave);
@@ -167,5 +176,12 @@ export default function LatticeField({ className = '' }) {
     };
   }, []);
 
-  return <canvas ref={canvasRef} className={className} aria-hidden="true" />;
+  return (
+    <canvas
+      ref={canvasRef}
+      className={className}
+      style={{ width: '100%', height: '100%' }}
+      aria-hidden="true"
+    />
+  );
 }

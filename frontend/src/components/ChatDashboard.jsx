@@ -3,6 +3,7 @@ import { io } from 'socket.io-client';
 import { useNavigate } from 'react-router-dom';
 import api, { SOCKET_URL, clearSession } from '../lib/api';
 import Logo from './visuals/Logo';
+import LatticeField from './visuals/LatticeField';
 import { useToast } from './visuals/Toast';
 import { encryptForRecipients, decryptEnvelope, b64decode, calculateIntegrity, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -151,6 +152,22 @@ export default function ChatDashboard() {
   );
 
   const socketRef = useRef(null);
+  // Ids that arrived live in this session — only these get the arrival bloom,
+  // so loading history doesn't set every bubble flashing at once. Capped: it
+  // gates a one-shot animation, so anything older than the recent tail is dead
+  // weight, and an unbounded set would grow for the life of the session.
+  const freshIdsRef = useRef(new Set());
+  const markFresh = useCallback((id) => {
+    const set = freshIdsRef.current;
+    set.add(String(id));
+    if (set.size > 60) {
+      // Sets iterate in insertion order, so this drops the oldest entries.
+      for (const old of set) {
+        if (set.size <= 40) break;
+        set.delete(old);
+      }
+    }
+  }, []);
   const [users, setUsers]               = useState([]);
   const [peer, setPeer]                 = useState(null);
   const [messages, setMessages]         = useState([]);
@@ -189,6 +206,17 @@ export default function ChatDashboard() {
   const [loadingOlder, setLoadingOlder]     = useState(false);
   const [atBottom, setAtBottom]             = useState(true);
   const scrollBoxRef      = useRef(null);
+
+  /** True when there is nothing below the fold worth jumping to. */
+  const measureAtBottom = useCallback(() => {
+    const box = scrollBoxRef.current;
+    if (!box) return true;
+    // A thread shorter than the viewport doesn't scroll at all, so it is always
+    // "at bottom" — the subtraction already yields 0, but be explicit.
+    if (box.scrollHeight <= box.clientHeight) return true;
+    return box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+  }, []);
+
   const stickToBottomRef  = useRef(true);
   const loadingOlderRef   = useRef(false);
   const [attachment, setAttachment]     = useState(null);
@@ -572,11 +600,17 @@ export default function ChatDashboard() {
       }
 
       try {
+        const t0 = performance.now();
         const text = await decryptEnvelope(msg.payload, currentUser.id, privateKey);
-        
+        addLog(
+          `Decapsulated content key · decrypted ${text.length}B in ${Math.round(performance.now() - t0)}ms`,
+          'cyan',
+        );
+
         if (peerRef.current && String(peerRef.current.id) === String(msg.fromId)) {
           setMessages(prev => {
             if (prev.some(m => String(m.id) === String(msg.id))) return prev;
+            markFresh(msg.id);
             return [...prev, { ...msg, text, isMine: false }];
           });
           // Send read receipt if we are actively viewing this chat
@@ -590,6 +624,7 @@ export default function ChatDashboard() {
         if (peerRef.current && String(peerRef.current.id) === String(msg.fromId)) {
           setMessages(prev => {
             if (prev.some(m => String(m.id) === String(msg.id))) return prev;
+            markFresh(msg.id);
             return [...prev, { ...msg, text: '[Locked — previous session key]', isMine: false, error: true }];
           });
         }
@@ -627,6 +662,7 @@ export default function ChatDashboard() {
     // read receipts, deletes, reactions and replies all work on a fresh message.
     s.on('message_sent', ({ tempId, id, timestamp, delivered }) => {
       if (!tempId) return;
+      if (freshIdsRef.current.delete(String(tempId))) markFresh(id);
       setMessages(prev => prev.map(m =>
         String(m.id) === String(tempId)
           ? { ...m, id, timestamp: timestamp || m.timestamp, delivered: !!delivered }
@@ -706,7 +742,21 @@ export default function ChatDashboard() {
   useEffect(() => {
     // Only follow new messages when the reader is already at the bottom.
     if (stickToBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, peerTyping]);
+    // Re-measure after the DOM settles: the content that just changed decides
+    // whether there is anything left to jump to.
+    const id = requestAnimationFrame(() => setAtBottom(measureAtBottom()));
+    return () => cancelAnimationFrame(id);
+  }, [messages, peerTyping, measureAtBottom]);
+
+  /* Re-measure when the pane itself resizes — opening the console or the
+     drawer changes the viewport without ever firing a scroll event. */
+  useEffect(() => {
+    const box = scrollBoxRef.current;
+    if (!box || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => setAtBottom(measureAtBottom()));
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, [peer?.id, measureAtBottom]);
 
   // Integrity depends only on the message chain. Recomputing it on replyingTo
   // also scroll-jumped the view every time a reply was picked.
@@ -770,8 +820,17 @@ export default function ChatDashboard() {
     try {
       const unreadIds = [];
       const { data } = await api.get(`/api/messages/${peerId}?limit=${PAGE_SIZE}&_t=${Date.now()}`);
+      const t0 = performance.now();
       const history = await decryptRows(data, unreadIds);
       setMessages(history);
+      if (data.length) {
+        const opened = history.filter(m => !m.error).length;
+        addLog(
+          `Opened ${opened}/${data.length} stored message${data.length === 1 ? '' : 's'} ` +
+          `in ${Math.round(performance.now() - t0)}ms`,
+          'green',
+        );
+      }
       // A full page suggests there is more behind it; a short page is the end.
       setHasMoreHistory(data.length === PAGE_SIZE);
 
@@ -829,7 +888,7 @@ export default function ChatDashboard() {
 
   const handleMessagesScroll = (e) => {
     const box = e.currentTarget;
-    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+    const nearBottom = measureAtBottom();
     stickToBottomRef.current = nearBottom;
     setAtBottom(nearBottom);
     if (box.scrollTop < 80) loadOlderMessages();
@@ -929,9 +988,17 @@ export default function ChatDashboard() {
       // whole message twice, doubling both the lattice work and stored bytes.
       const recipients = buildRecipients();
       if (recipients.length === 0) throw new Error('NO_RECIPIENT_KEYS');
+      const t0 = performance.now();
       const payload = await encryptForRecipients(textToSend, recipients);
-      
+      const ms = Math.round(performance.now() - t0);
+      addLog(
+        `ML-KEM-768 encapsulated to ${recipients.length} recipient${recipients.length === 1 ? '' : 's'} · ` +
+        `AES-256-GCM sealed ${textToSend.length}B in ${ms}ms`,
+        'green',
+      );
+
       const tempId = `l-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      markFresh(tempId);
       setMessages(prev => [...prev, {
         id: tempId, text: textToSend, isMine: true, timestamp: new Date(),
         delivered: false, read: false, type: msgType, replyToId
@@ -984,6 +1051,7 @@ export default function ChatDashboard() {
       const payload = next.length
         ? await encryptForRecipients(JSON.stringify(next), buildRecipients())
         : null;
+      addLog(payload ? 'Reaction sealed under the thread key' : 'Reaction cleared', 'cyan');
       socketRef.current?.emit('message_reaction', { messageId, payload });
     } catch (err) {
       addLog(`Could not send reaction: ${err.message}`, 'pink');
@@ -1291,7 +1359,7 @@ export default function ChatDashboard() {
 
       <aside
         className={`fixed lg:relative inset-y-0 left-0 z-40 w-72 max-w-[85vw] flex flex-col flex-shrink-0
-                    glass !rounded-none lg:!rounded-2xl m-0 lg:m-3 lg:mr-0
+                    glass sidebar-shell !rounded-none lg:!rounded-2xl m-0 lg:m-3 lg:mr-0
                     transition-transform duration-300 ease-out
                     ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0`}
       >
@@ -1469,7 +1537,7 @@ export default function ChatDashboard() {
       <main className="relative z-10 flex-1 min-w-0 flex flex-col glass !rounded-none lg:!rounded-2xl m-0 lg:m-3 overflow-hidden">
         {peer ? (
           <>
-            <div className="flex items-center justify-between px-3 sm:px-5 py-3 sm:py-3.5 border-b border-white/[0.06] flex-shrink-0 gap-2 sm:gap-3">
+            <div className="chat-header-bar relative z-10 flex items-center justify-between px-3 sm:px-5 py-3 sm:py-3.5 flex-shrink-0 gap-2 sm:gap-3 backdrop-blur-md">
               <div className="flex items-center gap-2 sm:gap-3 min-w-0">
                 <button
                   onClick={() => setSidebarOpen(true)}
@@ -1572,8 +1640,19 @@ export default function ChatDashboard() {
               )}
             </AnimatePresence>
 
-            <div ref={scrollBoxRef} onScroll={handleMessagesScroll} className="chat-canvas flex-1 overflow-y-auto px-3 sm:px-4 py-4 sm:py-5">
-              <div className="flex flex-col gap-3 min-h-full justify-end">
+            {/* The backdrop belongs to the message region, so it is sized to
+                it — not stretched across the header and console as well. It
+                stays outside the scroll container: in the scroll flow it added
+                its own height and produced a phantom gap under the messages. */}
+            <div className="relative flex-1 min-h-0 flex flex-col">
+              <div className="absolute inset-0 z-0 overflow-hidden pointer-events-none" aria-hidden="true">
+                <div className="chat-ambient absolute inset-0" />
+                <LatticeField className="lattice-ambient" />
+                <div className="canvas-breathe" />
+              </div>
+
+            <div ref={scrollBoxRef} onScroll={handleMessagesScroll} className="relative z-10 flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4 sm:py-5">
+              <div className="relative z-10 flex flex-col">
                 {loadingOlder && (
                   <div className="flex items-center justify-center gap-2 py-2 text-[10px] text-slate-500">
                     <Loader2 size={11} className="animate-spin" /> Loading older messages…
@@ -1633,7 +1712,7 @@ export default function ChatDashboard() {
                 )}
 
                 {!hasMoreHistory && messages.length > 0 && (
-                  <div className="text-center text-[10px] text-slate-600 py-1">
+                  <div className="text-center text-[10px] text-slate-600 pt-2 pb-0">
                     Beginning of your encrypted conversation
                   </div>
                 )}
@@ -1651,7 +1730,7 @@ export default function ChatDashboard() {
                   {renderRows.map((row, i) => {
                     if (row.kind === 'day') {
                       return (
-                        <div key={row.key} className="sticky top-1 z-20 flex items-center justify-center my-3 pointer-events-none">
+                        <div key={row.key} className="flex items-center justify-center mt-6 mb-2 pointer-events-none">
                           <span className="text-[10px] font-semibold uppercase tracking-widest text-slate-400
                                            bg-navy-900/90 backdrop-blur-md border border-white/[0.08]
                                            shadow-lg shadow-black/30 px-3 py-1 rounded-full">
@@ -1663,7 +1742,7 @@ export default function ChatDashboard() {
 
                     if (row.kind === 'locked') {
                       return (
-                        <div key={row.key} className="flex items-center justify-center my-2">
+                        <div key={row.key} className="flex items-center justify-center my-4">
                           <div
                             className="flex items-center gap-2 text-[11px] text-slate-500 bg-white/[0.03] border border-white/[0.07] px-3 py-1.5 rounded-full"
                             title="These were encrypted to a key this device no longer holds. Generating a new keypair — by signing in on a new device or after clearing site data — makes older messages unreadable here."
@@ -1677,6 +1756,9 @@ export default function ChatDashboard() {
 
                     const msg = row.msg;
                     const isGrouped = !row.groupStart;
+                    // A separator directly above already supplies the gap, so
+                    // the row must not stack its own on top of it.
+                    const afterBreak = renderRows[i - 1] && renderRows[i - 1].kind !== 'msg';
 
                     // Hover actions, built once and placed inboard of the bubble on
                     // either side, so they never collide with the window edge.
@@ -1717,7 +1799,7 @@ export default function ChatDashboard() {
                       <motion.div
                         id={`msg-${msg.id}`}
                         key={row.key || i}
-                        className={`flex items-end gap-2 group ${msg.isMine ? 'justify-end' : 'justify-start'} ${isGrouped ? 'mt-0.5' : 'mt-3'}`}
+                        className={`flex items-end gap-2 group ${msg.isMine ? 'justify-end' : 'justify-start'} ${afterBreak ? 'mt-0' : isGrouped ? 'mt-[3px]' : 'mt-4'}`}
                         initial={{ opacity: 0, y: 8, x: msg.isMine ? 10 : -10 }}
                         animate={{ opacity: 1, y: 0, x: 0 }}
                         transition={{ type: 'spring', stiffness: 380, damping: 30 }}
@@ -1740,6 +1822,7 @@ export default function ChatDashboard() {
                             msg.isMine ? 'bubble-mine' : 'bubble-theirs',
                             row.groupEnd ? (msg.isMine ? 'bubble-tail-mine' : 'bubble-tail-theirs') : '',
                             msg.error ? 'bubble-error' : '',
+                            freshIdsRef.current.has(String(msg.id)) ? 'bubble-arrive' : '',
                           ].filter(Boolean).join(' ')}>
                             {renderBubbleContent(msg)}
                           </div>
@@ -1784,21 +1867,26 @@ export default function ChatDashboard() {
               </div>
             </div>
 
-            <AnimatePresence>
-              {!atBottom && (
-                <motion.button
-                  type="button" onClick={jumpToLatest}
-                  initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}
-                  className="jump-latest"
-                  style={{ bottom: showConsole ? '13.5rem' : '5.75rem' }}
-                >
-                  <ArrowDown size={12} /> Jump to latest
-                </motion.button>
-              )}
-            </AnimatePresence>
+            {/* Inside the message region, so `bottom` is measured from the top
+                of the composer — no magic offsets to dodge the console. */}
+            <div className="absolute inset-x-0 bottom-4 z-20 flex justify-center pointer-events-none">
+              <AnimatePresence>
+                {!atBottom && (
+                  <motion.button
+                    type="button" onClick={jumpToLatest}
+                    initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}
+                    className="jump-latest pointer-events-auto"
+                  >
+                    <ArrowDown size={12} /> Jump to latest
+                  </motion.button>
+                )}
+              </AnimatePresence>
+            </div>
+            </div>
+
 
             {/* Input Area */}
-            <div className="relative px-3 sm:px-4 py-3 sm:py-3.5 border-t border-white/[0.06] flex-shrink-0 bg-navy-950/70 backdrop-blur-md z-10 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+            <div className="composer-bar composer-glow relative px-3 sm:px-4 py-3 sm:py-3.5 flex-shrink-0 backdrop-blur-md z-10 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
               
               {replyingTo && (
                 <div className="mb-2 flex items-center justify-between bg-black/40 p-2 rounded-lg border-l-4 border-emerald-400">
@@ -1854,7 +1942,7 @@ export default function ChatDashboard() {
             
             <AnimatePresence>
               {showConsole && (
-                <motion.div initial={{ height: 0 }} animate={{ height: 144 }} exit={{ height: 0 }} className="flex-shrink-0 border-t border-white/[0.06] bg-black/25 overflow-hidden">
+                <motion.div initial={{ height: 0 }} animate={{ height: 144 }} exit={{ height: 0 }} className="relative z-10 flex-shrink-0 border-t border-white/[0.06] bg-navy-950/70 backdrop-blur-md overflow-hidden">
                   <div className="flex items-center gap-2 px-3.5 py-2 border-b border-white/[0.05]">
                     <Terminal size={11} className="text-slate-600" />
                     <span className="text-[10px] font-semibold tracking-widest uppercase text-slate-600">Quantum Protocol Stream</span>
