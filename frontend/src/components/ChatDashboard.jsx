@@ -5,7 +5,8 @@ import api, { SOCKET_URL, clearSession } from '../lib/api';
 import Logo from './visuals/Logo';
 import LatticeField from './visuals/LatticeField';
 import { useToast } from './visuals/Toast';
-import { encryptForRecipients, decryptEnvelope, b64decode, calculateIntegrity, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
+import { encryptForRecipients, decryptEnvelope, b64encode, b64decode, calculateIntegrity, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
+import { createMediaCrypto, withEncodedTransforms } from '../crypto/mediaTransport';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Send, Terminal, LogOut, Lock, Fingerprint,
@@ -267,6 +268,16 @@ export default function ChatDashboard() {
   /* ─── WebRTC Logic ─── */
   const rtcConfig = { iceServers: ICE_SERVERS };
 
+  // Per-call media crypto. The master secret is minted by the caller and rides
+  // inside the ML-KEM-sealed offer, so the media key never crosses the wire in
+  // a form a harvested recording could later expose.
+  const mediaCryptoRef  = useRef(null);
+  const mediaSecretRef  = useRef(null);
+  // 'pq' when frames are sealed under the ML-KEM call key, 'srtp' when the
+  // browser has no encoded-frame API. Shown in the call UI, because claiming
+  // post-quantum media when it silently fell back would be the worst outcome.
+  const [mediaProtection, setMediaProtection] = useState(null);
+
   const flushPendingCandidates = async () => {
     const pc = rtcPeerConnection.current;
     if (!pc) return;
@@ -309,12 +320,100 @@ export default function ChatDashboard() {
       setLocalStream(stream);
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 
-      const pc = new RTCPeerConnection(rtcConfig);
+      const pc = new RTCPeerConnection(withEncodedTransforms(rtcConfig));
       rtcPeerConnection.current = pc;
 
-      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      // The caller mints the media secret; the callee already took it off the
+      // offer it accepted. Either way it exists before any track is added.
+      if (isInitiator) mediaSecretRef.current = crypto.getRandomValues(new Uint8Array(32));
+      const masterSecret = mediaSecretRef.current;
+
+      const media = masterSecret
+        ? await createMediaCrypto({
+            masterSecret,
+            isInitiator,
+            onError: ({ mode, message }) =>
+              addLog(`Media ${mode === 'encrypt' ? 'sealing' : 'opening'} failed: ${message}`, 'pink'),
+            onFirst: ({ mode }) => {
+              addLog(mode === 'encrypt'
+                ? 'First outgoing frame sealed'
+                : 'First incoming frame opened', 'green');
+              // Only an opened incoming frame proves the round trip works;
+              // sealing alone proves nothing about what the peer can read.
+              if (mode === 'decrypt') setMediaProtection('pq');
+            },
+          })
+        : null;
+      mediaCryptoRef.current = media;
+
+      if (media?.support === 'none' || !masterSecret) {
+        setMediaProtection('srtp');
+        addLog('This browser has no encoded-frame API — media falls back to DTLS-SRTP only', 'pink');
+      } else {
+        // Stays 'pending' until a frame is actually opened. Claiming protection
+        // that silently failed is worse than admitting the fallback.
+        setMediaProtection('pending');
+        addLog(`Media transform path: ${media.support}`, 'cyan');
+      }
+
+      stream.getTracks().forEach(track => {
+        const sender = pc.addTrack(track, stream);
+        media?.applyToSender(sender);
+      });
+
+      // Pin VP8 for video whenever frames are being sealed.
+      //
+      // The cipher leaves a short codec header in the clear so the packetizer
+      // can still fragment the frame, and those offsets (10 bytes on a key
+      // frame, 3 on a delta) are VP8's. H.264 carries Annex-B NAL start codes
+      // throughout the payload, so sealing past the first few bytes leaves the
+      // packetizer hunting for boundaries in ciphertext: it splits in the wrong
+      // places and the far end decodes a smear. macOS Chrome will happily pick
+      // H.264 for hardware encoding, so the codec has to be forced, not hoped
+      // for. This is why every insertable-streams implementation pins VP8.
+      if (media && media.support !== 'none') {
+        for (const transceiver of pc.getTransceivers()) {
+          if (transceiver.sender?.track?.kind !== 'video') continue;
+          if (typeof transceiver.setCodecPreferences !== 'function') continue;
+          try {
+            const supported = RTCRtpSender.getCapabilities('video')?.codecs || [];
+            const vp8 = supported.filter(c => /vp8/i.test(c.mimeType));
+            if (vp8.length) {
+              // VP8 first, everything else after, so a peer that cannot do VP8
+              // still negotiates something rather than failing outright.
+              transceiver.setCodecPreferences([
+                ...vp8,
+                ...supported.filter(c => !/vp8/i.test(c.mimeType)),
+              ]);
+            }
+          } catch (err) {
+            addLog(`Could not pin VP8: ${err.message}`, 'pink');
+          }
+        }
+      }
+
+      // Report what was actually negotiated once the call settles — the pin is
+      // a preference, not a guarantee, and a silent fallback to H.264 would
+      // look like a rendering bug rather than a codec one.
+      pc.addEventListener('connectionstatechange', async () => {
+        if (pc.connectionState !== 'connected') return;
+        try {
+          const stats = await pc.getStats();
+          const codecs = new Set();
+          stats.forEach(r => {
+            if (r.type === 'outbound-rtp' && r.kind === 'video' && r.codecId) {
+              const c = stats.get(r.codecId);
+              if (c?.mimeType) codecs.add(c.mimeType);
+            }
+          });
+          if (codecs.size) addLog(`Video codec in use: ${[...codecs].join(', ')}`, 'cyan');
+        } catch { /* stats are best effort */ }
+      });
 
       pc.ontrack = (event) => {
+        // Attach before the decoder sees anything, or the first frames arrive
+        // as ciphertext and the picture opens corrupt.
+        media?.applyToReceiver(event.receiver);
         setRemoteStream(event.streams[0]);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
       };
@@ -328,7 +427,13 @@ export default function ChatDashboard() {
       if (isInitiator) {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        encryptAndSendSignal({ type: 'offer', sdp: offer }, peerRef.current.id);
+        encryptAndSendSignal({
+          type: 'offer',
+          sdp: offer,
+          // Sealed to the peer's ML-KEM public key along with the rest of the
+          // signal, which is what makes the media layer post-quantum.
+          mediaKey: b64encode(mediaSecretRef.current),
+        }, peerRef.current.id);
         setCallStatus('calling');
       }
     } catch (err) {
@@ -346,6 +451,9 @@ export default function ChatDashboard() {
       if (signal.type === 'offer') {
         if (peerRef.current && String(peerRef.current.id) === String(fromId)) {
           callPayloadRef.current = signal;
+          // Lift the media key out now: initWebRTC needs it before it adds any
+          // track, and it only ever travels inside this decrypted offer.
+          mediaSecretRef.current = signal.mediaKey ? b64decode(signal.mediaKey) : null;
           setCallStatus('receiving');
         } else {
           addLog(`Missed call from ${fromId} (not in active chat)`, 'pink');
@@ -436,6 +544,15 @@ export default function ChatDashboard() {
       try { rtcPeerConnection.current.close(); } catch { /* already closed */ }
       rtcPeerConnection.current = null;
     }
+
+    // Tear down the media crypto worker and forget the call key. Keeping the
+    // secret past the call it belongs to buys nothing and widens the window in
+    // which a compromised tab could leak it.
+    try { mediaCryptoRef.current?.close(); } catch { /* already gone */ }
+    mediaCryptoRef.current = null;
+    if (mediaSecretRef.current) mediaSecretRef.current.fill(0);
+    mediaSecretRef.current = null;
+    setMediaProtection(null);
 
     setLocalStream(null);
     setRemoteStream(null);
@@ -1623,6 +1740,23 @@ export default function ChatDashboard() {
                       <div className="absolute top-4 right-4 w-32 md:w-48 aspect-[3/4] bg-navy-900 rounded-xl overflow-hidden shadow-2xl border border-white/10">
                         <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
                       </div>
+                      {mediaProtection && (
+                        <div className={`absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-semibold backdrop-blur-md border ${
+                          mediaProtection === 'pq'
+                            ? 'bg-emerald-400/10 border-emerald-400/30 text-emerald-300'
+                            : mediaProtection === 'pending'
+                            ? 'bg-cyan-400/10 border-cyan-400/30 text-cyan-300'
+                            : 'bg-amber-400/10 border-amber-400/30 text-amber-300'
+                        }`}>
+                          <Lock size={11} />
+                          {mediaProtection === 'pq'
+                            ? 'Video sealed · ML-KEM-768 + AES-256-GCM'
+                            : mediaProtection === 'pending'
+                            ? 'Negotiating sealed media…'
+                            : 'Video on DTLS-SRTP only — not quantum-safe'}
+                        </div>
+                      )}
+
                       <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-navy-900/80 backdrop-blur-lg px-6 py-3 rounded-full border border-white/10">
                         <button onClick={toggleMute} className={`p-3 rounded-full ${isMuted ? 'bg-rose-500/20 text-rose-500' : 'bg-white/10 text-white hover:bg-white/20'}`}>
                           {isMuted ? <MicOff size={20}/> : <Mic size={20}/>}
