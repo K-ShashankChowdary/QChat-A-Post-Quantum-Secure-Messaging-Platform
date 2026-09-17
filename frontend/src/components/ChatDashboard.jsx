@@ -1182,7 +1182,7 @@ export default function ChatDashboard() {
                   role="menuitem"
                   title={active ? `Remove ${em}` : `React with ${em}`}
                   onClick={() => { sendReaction(msg.id, em); setReactionPickerFor(null); }}
-                  className={`w-8 h-8 flex items-center justify-center rounded-full text-base leading-none transition-transform hover:scale-125 hover:bg-white/10 ${active ? 'bg-cyan-400/20 ring-1 ring-cyan-400/40' : ''}`}
+                  className={`w-11 h-11 flex items-center justify-center rounded-full text-[28px] leading-none transition-transform hover:scale-125 hover:bg-white/10 ${active ? 'bg-cyan-400/20 ring-1 ring-cyan-400/40' : ''}`}
                 >
                   {em}
                 </button>
@@ -1250,18 +1250,22 @@ export default function ChatDashboard() {
     }
     if (Object.keys(counts).length === 0) return null;
     return (
-      <div className="flex items-center gap-1 mt-1 -mb-3 ml-1 z-20 relative drop-shadow-md">
+      <div className={`flex items-center gap-1 -mt-2 z-20 relative drop-shadow-md ${
+        msg.isMine ? 'mr-2' : 'ml-2'
+      }`}>
         {Object.entries(counts).map(([emoji, { count, mine: isMine }]) => (
           <button
             key={emoji}
             type="button"
             title={isMine ? 'Remove your reaction' : `React with ${emoji}`}
             onClick={() => sendReaction(msg.id, emoji)}
-            className={`border text-[10px] px-1.5 py-0.5 rounded-full flex items-center gap-1 shadow-sm transition-colors ${isMine
+            className={`border rounded-full flex items-center gap-1 shadow-sm ring-2 ring-navy-950
+                        pl-1.5 pr-1.5 py-[3px] transition-transform hover:scale-110 active:scale-95 ${isMine
               ? 'bg-cyan-400/20 border-cyan-400/40 text-cyan-200'
               : 'bg-navy-800 border-white/10 text-slate-200 hover:bg-navy-700'}`}
           >
-            <span>{emoji}</span> {count > 1 && <span className="opacity-70">{count}</span>}
+            <span className="text-[17px] leading-none">{emoji}</span>
+            {count > 1 && <span className="text-[11px] font-semibold leading-none opacity-70 pr-0.5">{count}</span>}
           </button>
         ))}
       </div>
@@ -1743,7 +1747,7 @@ export default function ChatDashboard() {
                           {renderReactions(msg)}
 
                           {row.groupEnd && (
-                            <div className={`flex items-center gap-1 px-1 ${msg.reactions?.length ? 'mt-3' : 'mt-1'}`}>
+                            <div className={`flex items-center gap-1 px-1 ${msg.reactions?.length ? 'mt-1.5' : 'mt-1'}`}>
                               <span className="text-[10px] text-muted font-mono">{fmt(msg.timestamp)}</span>
                               {msg.isMine && !msg.deleted && (
                                 msg.read ? <CheckCheck size={12} className="text-cyan-400" /> :
