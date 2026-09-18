@@ -663,12 +663,6 @@ export default function ChatDashboard() {
   useEffect(() => {
     if (!currentUser.id) { navigate('/login'); return; }
 
-    const localPub = localStorage.getItem(`qchat_pub_${currentUser.id}`);
-    if (localPub) {
-      api.post('/api/auth/update-key', { userId: currentUser.id, publicKey: localPub })
-        .catch(err => addLog(`Key sync failed: ${err.message}`, 'pink'));
-    }
-
     // The server verifies this token during the handshake and derives our
     // identity from it, so no event needs to send a user id any more.
     const s = io(SOCKET_URL, {
@@ -877,11 +871,28 @@ export default function ChatDashboard() {
 
   // Integrity depends only on the message chain. Recomputing it on replyingTo
   // also scroll-jumped the view every time a reply was picked.
+  //
+  // The chain folds in msg.text, and an attachment's text is its entire base64
+  // envelope, so a thread with a few images means tens of megabytes of SHA-256
+  // per run. Keying the effect on `messages` re-ran it for read receipts and
+  // reactions too, which change none of its inputs. This key moves only when
+  // the chain genuinely does.
+  const chainKey = useMemo(
+    () => messages
+      .filter(m => !m.error && !m.deleted)
+      .map(m => `${m.id}:${new Date(m.timestamp).getTime()}:${m.isMine ? 'o' : 'i'}`)
+      .join('|'),
+    [messages],
+  );
+
   useEffect(() => {
     const ok = messages.filter(m => !m.error && !m.deleted);
     if (ok.length) calculateIntegrity(ok).then(setIntegrity).catch(() => setIntegrity(null));
     else setIntegrity(null);
-  }, [messages]);
+    // messages is deliberately not a dependency: chainKey is its distillation,
+    // and depending on both would defeat the point.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chainKey]);
 
   const fetchUsers = useCallback(async () => {
     try {
