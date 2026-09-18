@@ -80,21 +80,33 @@ encapsulation.
 
 #### Core Formulas:
 1. **Key Generation:**
-   - Generate random square matrix $A \in R_q^{3 \times 3}$.
-   - Generate small secret vector $s \in R_q^3$ and error vector $e \in R_q^3$.
-   - **Public Key Formula:** $t = A s + e$
-   - *Public Key = $(A, t)$, Secret Key = $(s)$.*
+   - Sample a 32-byte public seed $\rho$ and expand it into the matrix
+     $A \in R_q^{3 \times 3}$, so $A$ never has to be transmitted.
+   - Sample a small secret vector $s \in R_q^3$ and error vector $e \in R_q^3$.
+   - **Public key relation:** $t = A s + e$
+   - *Public key $= (\rho, t)$; secret key $= s$.*
 
-2. **Encapsulation (Sender generates ciphertext $c$ and Shared Secret $SS$ for Recipient):**
-   - Generate error vectors $e_1 \in R_q^3, e_2 \in R_q$.
-   - Compute polynomial $u = A^T r + e_1$.
-   - Compute scalar polynomial $v = t^T r + e_2 + \text{Encode}(SS)$.
-   - *Ciphertext $c = (u, v)$ is sent across the wire.*
+   Transmitting $\rho$ rather than $A$ is why the public key is **1184 bytes**:
+   $3 \times 384$ bytes for the three compressed polynomials of $t$, plus the 32-byte
+   seed. Sending $A$ itself would cost several kilobytes.
 
-3. **Decapsulation (Recipient unlocks $SS$):**
-   - Recipient applies their Secret Key $(s)$.
-   - $v - s^T u = (t^T r + e_2 + \text{Encode}(SS)) - s^T(A^T r + e_1) \approx \text{Encode}(SS)$.
-   - The error terms are small enough to cancel in the rounding, recovering $SS$ exactly.
+2. **Encapsulation** (sender produces ciphertext $c$ and shared secret $SS$):
+   - Sample a random message $m$ and a small vector $r \in R_q^3$, plus error terms
+     $e_1 \in R_q^3$ and $e_2 \in R_q$.
+   - $u = A^T r + e_1$
+   - $v = t^T r + e_2 + \text{Encode}(m)$
+   - *Ciphertext $c = (\text{Compress}(u), \text{Compress}(v))$ — **1088 bytes** after
+     compression — and $SS = \text{KDF}(m, H(c))$.*
+
+3. **Decapsulation** (recipient recovers $SS$):
+   - Apply the secret key: $v - s^T u = \big(t^T r + e_2 + \text{Encode}(m)\big) - s^T\big(A^T r + e_1\big) \approx \text{Encode}(m)$.
+   - The error terms stay small enough to vanish in the rounding, so $m$ decodes
+     exactly, and re-running the KDF yields the same 32-byte $SS$.
+
+> The shared secret is derived from $m$ rather than being encoded directly, and the
+> recipient re-encrypts $m$ to check the ciphertext was honestly formed. That is the
+> Fujisaki–Okamoto transform, and it is what upgrades the scheme from CPA to CCA
+> security — the property that matters when an attacker can submit chosen ciphertexts.
 
 ### 2.2 Code Implementation: Keypair Generation & Vaulting
 *File: `frontend/src/components/Register.jsx`*
@@ -333,7 +345,15 @@ messageSchema.index({ from_user_id: 1, to_user_id: 1, timestamp: -1 });
 To prevent the Zero-Knowledge backend from arbitrarily destroying chat sequences or executing selective-deletion assaults, QChat implements a block-synchronization hash string mathematically mirroring blockchain technology.
 
 #### Hash Formalism
-$H_n = \text{SHA256}_{digest}(H_{n-1} + \text{Text}_n + \text{Timestamp}_n + \text{Direction}_n)$
+
+$$H_0 = 0^{256}$$
+
+$$H_n = \mathrm{SHA\text{-}256}\!\left(H_{n-1} \,\|\, \mathrm{Text}_n \,\|\, \mathrm{Timestamp}_n \,\|\, \mathrm{Dir}_n\right), \qquad \mathrm{Dir}_n \in \{\texttt{in},\ \texttt{out}\}$$
+
+where $\|$ is byte concatenation and $H_0$ is 256 zero bits. Folding
+$\mathrm{Dir}_n$ into the hash is what stops a message being silently reattributed
+to the other party: the text and timestamp would be unchanged, but the chain
+would not be.
 
 #### Execution Snippet
 ```javascript
