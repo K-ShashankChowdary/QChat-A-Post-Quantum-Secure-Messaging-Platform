@@ -6,7 +6,7 @@ import Logo from './visuals/Logo';
 import LatticeField from './visuals/LatticeField';
 import { useToast } from './visuals/Toast';
 import { encryptForRecipients, decryptEnvelope, b64encode, b64decode, calculateIntegrity, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
-import { createMediaCrypto, withEncodedTransforms } from '../crypto/mediaTransport';
+import { createMediaCrypto, withEncodedTransforms, mediaTransformSupport } from '../crypto/mediaTransport';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Send, Terminal, LogOut, Lock, Fingerprint,
@@ -121,6 +121,20 @@ const unpackAttachment = (text) => {
   }
   return { name: null, mime: null, data: text };
 };
+
+/* ─── Attachment URL guard ───
+   An attachment's data is whatever the sender put in it. Rendered into an href
+   it could be a javascript: URL — React 18 renders those, and Chromium runs
+   them even on a link with a download attribute — which would hand a stranger
+   this page, the private key in localStorage included. Only a base64 data: URL
+   of the expected kind is ever rendered. */
+const SAFE_DATA_URL = {
+  image: /^data:image\/(png|jpe?g|gif|webp|bmp|avif|svg\+xml);base64,/i,
+  audio: /^data:audio\/[\w.+-]+(;[\w.+-]+=[\w.+-]+)*;base64,/i,
+  file:  /^data:([\w.+-]+\/[\w.+-]+)?(;[\w.+-]+=[\w.+-]+)*;base64,/i,
+};
+const safeDataUrl = (data, kind) =>
+  (typeof data === 'string' && SAFE_DATA_URL[kind]?.test(data) ? data : null);
 
 /* Optimistic bubbles carry a temp id until the server acks with the real one.
    Anything keyed off a server id (delete, react, reply) must wait for it. */
@@ -241,10 +255,36 @@ export default function ChatDashboard() {
   const localVideoRef                   = useRef(null);
   const remoteVideoRef                  = useRef(null);
   const callPayloadRef                  = useRef(null); // stores incoming offer
+  // The person a call is with, pinned when it starts. Signals go to them and
+  // only their signals are accepted. Keying both off the open chat let a call
+  // follow you into another conversation, and let any account hang it up.
+  const [callPeer, setCallPeer]         = useState(null);
+  const callPeerRef                     = useRef(null);
+  // Socket handlers are bound once, so they read call state from a ref.
+  const callStatusRef                   = useRef('idle');
+  const ringTimeoutRef                  = useRef(null);
+  const usersRef                        = useRef([]);
+
+  const updateCallStatus = (status) => {
+    callStatusRef.current = status;
+    setCallStatus(status);
+  };
+
+  const pinCallPeer = (u) => {
+    callPeerRef.current = u ? { id: String(u.id), username: u.username, public_key: u.public_key } : null;
+    setCallPeer(callPeerRef.current);
+  };
 
   /* Persist selected peer across refreshes */
-  const selectPeer = (u) => {
+  const selectPeer = (u, { force = false } = {}) => {
+    // Mid-call the conversation is locked to the call: the call UI lives in the
+    // chat pane, and wandering off left it showing over someone else's thread.
+    if (!force && u && callStatusRef.current !== 'idle' && String(u.id) !== callPeerRef.current?.id) {
+      toast.info('Finish the current call before switching chats.');
+      return;
+    }
     setPeer(u);
+    if (u) setUsers(prev => prev.map(x => (String(x.id) === String(u.id) ? { ...x, unread: 0 } : x)));
     setSidebarOpen(false);
     setReplyingTo(null);
     setReactionPickerFor(null);
@@ -259,6 +299,7 @@ export default function ChatDashboard() {
   const peerRef          = useRef(null);
 
   useEffect(() => { peerRef.current = peer; }, [peer]);
+  useEffect(() => { usersRef.current = users; }, [users]);
 
   const addLog = useCallback((msg, type = 'info') => {
     const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -292,13 +333,15 @@ export default function ChatDashboard() {
     }
   };
 
-  const encryptAndSendSignal = async (signalData, toId) => {
+  // `target` defaults to the pinned call peer; it is evaluated at call time, so
+  // a cleanup that runs right after can't redirect a signal already being sent.
+  const encryptAndSendSignal = async (signalData, target = callPeerRef.current) => {
     try {
-      if (!peerRef.current?.public_key) return;
+      if (!target?.public_key) return;
       const payload = await encryptForRecipients(JSON.stringify(signalData), [
-        { id: String(peerRef.current.id), publicKey: b64decode(peerRef.current.public_key) },
+        { id: String(target.id), publicKey: b64decode(target.public_key) },
       ]);
-      socketRef.current?.emit('webrtc_signal', { toId, signalPayload: payload });
+      socketRef.current?.emit('webrtc_signal', { toId: target.id, signalPayload: payload });
       addLog(`Sent encrypted WebRTC signal (${signalData.type || 'candidate'})`, 'cyan');
     } catch (err) {
       addLog(`Failed to encrypt signal: ${err.message}`, 'pink');
@@ -320,13 +363,18 @@ export default function ChatDashboard() {
       setLocalStream(stream);
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 
-      const pc = new RTCPeerConnection(withEncodedTransforms(rtcConfig));
-      rtcPeerConnection.current = pc;
+      // The caller mints a media secret only if this browser can seal frames —
+      // offering a key it couldn't use left the callee encrypting toward a peer
+      // that sent plaintext. The callee already took the secret off the offer.
+      const canSeal = mediaTransformSupport() !== 'none';
+      if (isInitiator) mediaSecretRef.current = canSeal ? crypto.getRandomValues(new Uint8Array(32)) : null;
+      const masterSecret = canSeal ? mediaSecretRef.current : null;
 
-      // The caller mints the media secret; the callee already took it off the
-      // offer it accepted. Either way it exists before any track is added.
-      if (isInitiator) mediaSecretRef.current = crypto.getRandomValues(new Uint8Array(32));
-      const masterSecret = mediaSecretRef.current;
+      // Chrome's encoded-streams flag is fixed at construction, and once set
+      // every track must be piped through a transform or no media flows at all.
+      // So it is set only when a transform really will be attached.
+      const pc = new RTCPeerConnection(masterSecret ? withEncodedTransforms(rtcConfig) : rtcConfig);
+      rtcPeerConnection.current = pc;
 
       const media = masterSecret
         ? await createMediaCrypto({
@@ -419,8 +467,8 @@ export default function ChatDashboard() {
       };
 
       pc.onicecandidate = (event) => {
-        if (event.candidate && peerRef.current) {
-          encryptAndSendSignal({ type: 'candidate', candidate: event.candidate }, peerRef.current.id);
+        if (event.candidate && callPeerRef.current) {
+          encryptAndSendSignal({ type: 'candidate', candidate: event.candidate });
         }
       };
 
@@ -432,38 +480,96 @@ export default function ChatDashboard() {
           sdp: offer,
           // Sealed to the peer's ML-KEM public key along with the rest of the
           // signal, which is what makes the media layer post-quantum.
-          mediaKey: b64encode(mediaSecretRef.current),
-        }, peerRef.current.id);
-        setCallStatus('calling');
+          mediaKey: mediaSecretRef.current ? b64encode(mediaSecretRef.current) : undefined,
+        });
+        updateCallStatus('calling');
+
+        // Give up ringing after 45s rather than leaving the camera on forever.
+        clearTimeout(ringTimeoutRef.current);
+        ringTimeoutRef.current = setTimeout(() => {
+          if (callStatusRef.current !== 'calling') return;
+          encryptAndSendSignal({ type: 'end_call' });
+          cleanupCall();
+          toast.info('No answer.');
+        }, 45_000);
       }
     } catch (err) {
       addLog(`WebRTC Init failed: ${err.message}`, 'pink');
-      setCallStatus('idle');
+      toast.error(`Could not start the call: ${err.message}`);
+      // A callee that fails here would otherwise leave the caller ringing.
+      if (!isInitiator) encryptAndSendSignal({ type: 'decline' });
+      cleanupCall();
     }
+  };
+
+  /** A contact by id, refreshing the list once if they're new to it. */
+  const findContact = async (id) => {
+    const look = () => usersRef.current.find(u => String(u.id) === String(id));
+    let u = look();
+    if (!u) { await fetchUsers(); u = look(); }
+    return u ? { ...u, id: String(u.id) } : null;
   };
 
   const handleWebRTCSignal = async (fromId, signalPayload) => {
     try {
       const decrypted = await decryptEnvelope(signalPayload, currentUser.id, privateKey);
       const signal = JSON.parse(decrypted);
+      const from = String(fromId);
+      const pinned = callPeerRef.current;
       addLog(`Received encrypted WebRTC signal (${signal.type || 'candidate'})`, 'green');
 
       if (signal.type === 'offer') {
-        if (peerRef.current && String(peerRef.current.id) === String(fromId)) {
-          callPayloadRef.current = signal;
-          // Lift the media key out now: initWebRTC needs it before it adds any
-          // track, and it only ever travels inside this decrypted offer.
-          mediaSecretRef.current = signal.mediaKey ? b64decode(signal.mediaKey) : null;
-          setCallStatus('receiving');
-        } else {
-          addLog(`Missed call from ${fromId} (not in active chat)`, 'pink');
+        const status = callStatusRef.current;
+        const fromCallPeer = pinned?.id === from;
+
+        if (status === 'calling' && fromCallPeer) {
+          // Both sides rang each other at once. The lower user id keeps its
+          // call; the other drops its own attempt and takes this one instead.
+          if (String(currentUser.id) < from) return;
+          cleanupCall({ keepPeer: true, quiet: true });
+        } else if (status !== 'idle') {
+          // Already on (or ringing for) a call: say so, rather than silently
+          // replacing the call in progress or leaving the caller ringing.
+          const caller = await findContact(from);
+          if (caller) encryptAndSendSignal({ type: 'busy' }, caller);
+          addLog(`Turned away a call from ${caller?.username || from.slice(-6)} — already on a call`, 'pink');
+          return;
         }
-      } else if (signal.type === 'answer') {
-        if (rtcPeerConnection.current) {
-          await rtcPeerConnection.current.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-          await flushPendingCandidates();
-          setCallStatus('connected');
+
+        const caller = fromCallPeer ? pinned : await findContact(from);
+        if (!caller) return addLog('Ignored a call from an account not in your contacts', 'pink');
+
+        pinCallPeer(caller);
+        callPayloadRef.current = signal;
+        // Lift the media key out now: initWebRTC needs it before it adds any
+        // track, and it only ever travels inside this decrypted offer.
+        mediaSecretRef.current = signal.mediaKey ? b64decode(signal.mediaKey) : null;
+        // An incoming call opens that conversation, wherever you were — it
+        // used to be dropped as a "missed call" unless that chat was open.
+        if (String(peerRef.current?.id) !== caller.id) selectPeer(caller, { force: true });
+        updateCallStatus('receiving');
+        return;
+      }
+
+      // Every other signal belongs to the call in progress, and to nobody else.
+      if (!pinned || pinned.id !== from) {
+        return addLog(`Ignored a ${signal.type || 'candidate'} signal from outside this call`, 'pink');
+      }
+
+      if (signal.type === 'answer') {
+        const pc = rtcPeerConnection.current;
+        if (!pc) return;
+        clearTimeout(ringTimeoutRef.current);
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        await flushPendingCandidates();
+        // The callee couldn't seal frames, so stop sealing ours as well;
+        // otherwise each side receives a stream it can't decode.
+        if (signal.mediaSealed === false && mediaCryptoRef.current) {
+          mediaCryptoRef.current.disable?.();
+          setMediaProtection('srtp');
+          addLog('Peer cannot seal media — both directions fall back to DTLS-SRTP', 'pink');
         }
+        updateCallStatus('connected');
       } else if (signal.type === 'candidate') {
         const pc = rtcPeerConnection.current;
         // A candidate that arrives before the remote description is set throws
@@ -473,8 +579,13 @@ export default function ChatDashboard() {
         } else {
           pendingCandidatesRef.current.push(signal.candidate);
         }
-      } else if (signal.type === 'end_call') {
+      } else if (signal.type === 'end_call' || signal.type === 'decline' || signal.type === 'busy') {
+        const name = pinned.username || 'Your contact';
+        const was = callStatusRef.current;
         cleanupCall();
+        if (signal.type === 'decline') toast.info(`${name} declined the call.`);
+        else if (signal.type === 'busy') toast.info(`${name} is on another call.`);
+        else if (was === 'receiving') toast.info(`Missed call from ${name}.`);
       }
     } catch (err) {
       addLog(`Failed to process WebRTC signal: ${err.message}`, 'pink');
@@ -482,22 +593,41 @@ export default function ChatDashboard() {
   };
 
   const startCall = () => {
-    if (!peer) return;
+    if (!peer || callStatusRef.current !== 'idle') return;
+    if (!peer.public_key) return toast.error(`${peer.username} has no encryption key yet.`);
+    pinCallPeer(peer);
     initWebRTC(true);
   };
 
   const acceptCall = async () => {
     await initWebRTC(false);
     const pc = rtcPeerConnection.current;
-    if (pc && callPayloadRef.current) {
+    if (!pc || !callPayloadRef.current) return;
+    try {
       await pc.setRemoteDescription(new RTCSessionDescription(callPayloadRef.current.sdp));
       await flushPendingCandidates();
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      encryptAndSendSignal({ type: 'answer', sdp: answer }, peerRef.current.id);
-      setCallStatus('connected');
+      encryptAndSendSignal({
+        type: 'answer',
+        sdp: answer,
+        // Tells the caller whether we really seal frames, so it can drop its
+        // own cipher instead of sending us a stream we can't open.
+        mediaSealed: !!mediaCryptoRef.current?.attached?.encrypt,
+      });
+      updateCallStatus('connected');
       callPayloadRef.current = null;
+    } catch (err) {
+      addLog(`Could not answer the call: ${err.message}`, 'pink');
+      encryptAndSendSignal({ type: 'decline' });
+      cleanupCall();
     }
+  };
+
+  /** Turn an incoming call down and tell the caller, so they stop ringing. */
+  const declineCall = () => {
+    encryptAndSendSignal({ type: 'decline' });
+    cleanupCall();
   };
 
   /**
@@ -535,7 +665,8 @@ export default function ChatDashboard() {
     return stopped;
   };
 
-  const cleanupCall = () => {
+  const cleanupCall = ({ keepPeer = false, quiet = false } = {}) => {
+    clearTimeout(ringTimeoutRef.current);
     // Capture is released before closing the connection, so a throw while
     // closing can never strand a live camera.
     const stopped = stopLocalCapture();
@@ -558,14 +689,15 @@ export default function ChatDashboard() {
     setRemoteStream(null);
     pendingCandidatesRef.current = [];
     callPayloadRef.current = null;
-    setCallStatus('idle');
+    updateCallStatus('idle');
+    if (!keepPeer) pinCallPeer(null);
     setIsMuted(false);
     setIsVideoOff(false);
-    addLog(`Call ended — released ${stopped} media track(s)`, 'cyan');
+    if (!quiet) addLog(`Call ended — released ${stopped} media track(s)`, 'cyan');
   };
 
   const endCall = () => {
-    if (peerRef.current) encryptAndSendSignal({ type: 'end_call' }, peerRef.current.id);
+    encryptAndSendSignal({ type: 'end_call' });
     cleanupCall();
   };
 
@@ -605,6 +737,7 @@ export default function ChatDashboard() {
   /* Safety net: release the camera if this component goes away mid-call
      (logout, navigation, an unhandled render error). */
   useEffect(() => () => {
+    clearTimeout(ringTimeoutRef.current);
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(t => t.stop());
       localStreamRef.current = null;
@@ -729,7 +862,7 @@ export default function ChatDashboard() {
             s.emit('message_read', { messageIds: [msg.id], toId: msg.fromId });
           }
         } else {
-          addLog(`New background message from ${String(msg.fromId).slice(-6)}`, 'info');
+          noteBackgroundMessage(msg.fromId);
         }
       } catch {
         if (peerRef.current && String(peerRef.current.id) === String(msg.fromId)) {
@@ -738,6 +871,8 @@ export default function ChatDashboard() {
             markFresh(msg.id);
             return [...prev, { ...msg, text: '[Locked — previous session key]', isMine: false, error: true }];
           });
+        } else {
+          noteBackgroundMessage(msg.fromId);
         }
       }
     });
@@ -756,7 +891,7 @@ export default function ChatDashboard() {
     });
 
     s.on('message_deleted', ({ messageId }) => {
-      setMessages(prev => prev.map(m => String(m.id) === String(messageId) ? { ...m, deleted: true, text: '', type: 'text' } : m));
+      setMessages(prev => prev.map(m => String(m.id) === String(messageId) ? { ...m, deleted: true, text: '', type: 'text', reactions: [] } : m));
     });
 
     // The server toggles and returns the authoritative array. Replacing rather
@@ -877,18 +1012,36 @@ export default function ChatDashboard() {
   // per run. Keying the effect on `messages` re-ran it for read receipts and
   // reactions too, which change none of its inputs. This key moves only when
   // the chain genuinely does.
+  //
+  // Only messages both devices hold identically are chained: acknowledged by
+  // the server (a temp id and a local clock never match the peer's copy), not
+  // deleted, and actually decrypted.
+  const chainable = (m) => !m.error && !m.deleted && isRealId(m.id);
+
   const chainKey = useMemo(
     () => messages
-      .filter(m => !m.error && !m.deleted)
-      .map(m => `${m.id}:${new Date(m.timestamp).getTime()}:${m.isMine ? 'o' : 'i'}`)
+      .filter(chainable)
+      .map(m => `${m.id}:${new Date(m.timestamp).getTime()}`)
       .join('|'),
     [messages],
   );
 
   useEffect(() => {
-    const ok = messages.filter(m => !m.error && !m.deleted);
-    if (ok.length) calculateIntegrity(ok).then(setIntegrity).catch(() => setIntegrity(null));
-    else setIntegrity(null);
+    const entries = messages.filter(chainable).map(m => ({
+      from: m.isMine ? currentUser.id : m.fromId,
+      id: m.id,
+      timestamp: m.timestamp,
+      text: m.text,
+    }));
+    let cancelled = false;
+    if (entries.length) {
+      calculateIntegrity(entries)
+        .then(digest => { if (!cancelled) setIntegrity(digest); })
+        .catch(() => { if (!cancelled) setIntegrity(null); });
+    } else {
+      setIntegrity(null);
+    }
+    return () => { cancelled = true; };
     // messages is deliberately not a dependency: chainKey is its distillation,
     // and depending on both would defeat the point.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -896,8 +1049,11 @@ export default function ChatDashboard() {
 
   const fetchUsers = useCallback(async () => {
     try {
-      const { data } = await api.get(`/api/users?_t=${Date.now()}`);
+      const { data: raw } = await api.get(`/api/users?_t=${Date.now()}`);
+      // The open chat is being read, so it never shows an unread count.
+      const data = raw.map(u => (String(u.id) === String(peerRef.current?.id) ? { ...u, unread: 0 } : u));
       setUsers(data);
+      usersRef.current = data;   // callers awaiting this read the ref straight away
       if (peerRef.current) {
         const refreshed = data.find(u => String(u.id) === String(peerRef.current.id));
         if (refreshed) {
@@ -917,6 +1073,19 @@ export default function ChatDashboard() {
       console.error('Failed to fetch peers', err);
     }
   }, []);
+
+  /** A message for a chat that isn't open: count it, and surface a new sender. */
+  const noteBackgroundMessage = (fromId) => {
+    addLog(`New background message from ${String(fromId).slice(-6)}`, 'info');
+    const known = usersRef.current.some(u => String(u.id) === String(fromId));
+    if (known) {
+      setUsers(prev => prev.map(u => (String(u.id) === String(fromId) ? { ...u, unread: (u.unread || 0) + 1 } : u)));
+    } else {
+      // A first message from someone not in the list — it used to stay
+      // invisible until a reload. The refreshed list carries the unread count.
+      fetchUsers();
+    }
+  };
 
   /** Decrypt one page of history rows into renderable messages. */
   const decryptRows = (rows, unreadIds) => Promise.all(rows.map(async msg => {
@@ -950,7 +1119,15 @@ export default function ChatDashboard() {
       const { data } = await api.get(`/api/messages/${peerId}?limit=${PAGE_SIZE}&_t=${Date.now()}`);
       const t0 = performance.now();
       const history = await decryptRows(data, unreadIds);
-      setMessages(history);
+      // The reader may have moved to another chat while this was in flight; a
+      // late page must not land in the wrong conversation.
+      if (String(peerRef.current?.id) !== String(peerId)) return;
+      // Merge rather than replace: a live message that arrived during the fetch
+      // is already on screen and may not be in this page.
+      setMessages(prev => {
+        const known = new Set(history.map(m => String(m.id)));
+        return [...history, ...prev.filter(m => !known.has(String(m.id)))];
+      });
       if (data.length) {
         const opened = history.filter(m => !m.error).length;
         addLog(
@@ -987,14 +1164,18 @@ export default function ChatDashboard() {
     try {
       // Cursor on the oldest loaded message rather than an offset, so live
       // arrivals can't shift the window and skip a page.
+      // The id breaks ties between messages that share a millisecond.
       const before = new Date(oldest.timestamp).toISOString();
+      const tie = isRealId(oldest.id) ? `&beforeId=${encodeURIComponent(oldest.id)}` : '';
       const { data } = await api.get(
-        `/api/messages/${peerId}?limit=${PAGE_SIZE}&before=${encodeURIComponent(before)}`
+        `/api/messages/${peerId}?limit=${PAGE_SIZE}&before=${encodeURIComponent(before)}${tie}`
       );
+      if (String(peerRef.current?.id) !== String(peerId)) return;
 
       if (data.length === 0) { setHasMoreHistory(false); return; }
 
       const older = await decryptRows(data, null);
+      if (String(peerRef.current?.id) !== String(peerId)) return;
       setMessages(prev => {
         const known = new Set(prev.map(m => String(m.id)));
         return [...older.filter(m => !known.has(String(m.id))), ...prev];
@@ -1093,8 +1274,16 @@ export default function ChatDashboard() {
 
   const sendMessage = async (e) => {
     e?.preventDefault();
-    if ((!input.trim() && !attachment) || !peer || !socketRef.current || encrypting) return;
-    
+    // Pinned up front: switching chats during the encryption await used to
+    // drop the bubble into the new chat while the message went to the old one.
+    const target = peerRef.current;
+    if ((!input.trim() && !attachment) || !target || !socketRef.current || encrypting) return;
+    if (!target.public_key) {
+      toast.error(`${target.username} has no encryption key yet — nothing was sent.`);
+      return;
+    }
+    const draft = { input, attachment, replyingTo };
+
     // Attachments travel as an envelope so the filename/mime survive the trip.
     const textToSend = attachment
       ? packAttachment({ name: attachment.name, mime: attachment.mime, data: attachment.base64 })
@@ -1109,12 +1298,12 @@ export default function ChatDashboard() {
     setAttachment(null);
     setReplyingTo(null);
 
-    socketRef.current.emit('stop_typing', { toId: peer.id });
+    socketRef.current.emit('stop_typing', { toId: target.id });
     setEncrypting(true);
     try {
       // v2: encrypt once and wrap the content key per party. v1 encrypted the
       // whole message twice, doubling both the lattice work and stored bytes.
-      const recipients = buildRecipients();
+      const recipients = buildRecipients(target);
       if (recipients.length === 0) throw new Error('NO_RECIPIENT_KEYS');
       const t0 = performance.now();
       const payload = await encryptForRecipients(textToSend, recipients);
@@ -1126,18 +1315,26 @@ export default function ChatDashboard() {
       );
 
       const tempId = `l-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      markFresh(tempId);
-      setMessages(prev => [...prev, {
-        id: tempId, text: textToSend, isMine: true, timestamp: new Date(),
-        delivered: false, read: false, type: msgType, replyToId
-      }]);
+      if (String(peerRef.current?.id) === String(target.id)) {
+        markFresh(tempId);
+        setMessages(prev => [...prev, {
+          id: tempId, text: textToSend, isMine: true, timestamp: new Date(),
+          delivered: false, read: false, type: msgType, replyToId
+        }]);
+      }
 
       socketRef.current?.emit('send_message', {
-        tempId, toId: peer.id, payload, senderPayload: null,
-        type: msgType, replyToId
+        tempId, toId: target.id, payload, type: msgType, replyToId,
       });
     } catch (err) {
       addLog(`Encryption failed: ${err.message}`, 'pink');
+      toast.error('That message could not be encrypted, so it was not sent.');
+      // Give the draft back instead of losing what was typed.
+      if (String(peerRef.current?.id) === String(target.id)) {
+        setInput(draft.input);
+        setAttachment(draft.attachment);
+        setReplyingTo(draft.replyingTo);
+      }
     } finally {
       setEncrypting(false);
     }
@@ -1155,7 +1352,7 @@ export default function ChatDashboard() {
     if (!ok) return;
 
     socketRef.current?.emit('delete_message', { messageId });
-    setMessages(prev => prev.map(m => String(m.id) === String(messageId) ? { ...m, deleted: true, text: '', type: 'text' } : m));
+    setMessages(prev => prev.map(m => String(m.id) === String(messageId) ? { ...m, deleted: true, text: '', type: 'text', reactions: [] } : m));
   };
 
   const sendReaction = async (messageId, emoji) => {
@@ -1187,12 +1384,12 @@ export default function ChatDashboard() {
   };
 
   /** Everyone who should be able to read what we send: the peer and ourselves. */
-  const buildRecipients = () => {
+  const buildRecipients = (target = peerRef.current) => {
     const stored = JSON.parse(localStorage.getItem('qchat_user') || '{}');
     const myPub = stored.publicKey || stored.public_key;
     const list = [];
-    if (peerRef.current?.public_key) {
-      list.push({ id: String(peerRef.current.id), publicKey: b64decode(peerRef.current.public_key) });
+    if (target?.public_key) {
+      list.push({ id: String(target.id), publicKey: b64decode(target.public_key) });
     }
     if (myPub) list.push({ id: String(currentUser.id), publicKey: b64decode(myPub) });
     return list;
@@ -1300,7 +1497,14 @@ export default function ChatDashboard() {
   };
 
   const handleKeyDown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } };
-  const logout = () => { localStorage.removeItem('qchat_token'); localStorage.removeItem('qchat_user'); navigate('/login'); };
+  const logout = () => {
+    // Hang up first so the other side isn't left in a dead call, and clear the
+    // remembered chat so the next account on this browser doesn't reopen it.
+    if (callStatusRef.current !== 'idle') endCall();
+    socketRef.current?.close();
+    clearSession();
+    navigate('/login');
+  };
 
   const renderBubbleContent = (msg) => {
     if (msg.deleted) {
@@ -1310,15 +1514,22 @@ export default function ChatDashboard() {
     let content = msg.text;
     if (msg.type && msg.type !== 'text') {
       const { name, data } = unpackAttachment(msg.text);
-      if (msg.type === 'image') {
-        content = <img src={data} alt={name || 'Attachment'} className="max-w-[240px] max-h-[240px] rounded-md border border-white/10 mt-1 object-cover" />;
+      const src = safeDataUrl(data, msg.type === 'image' || msg.type === 'audio' ? msg.type : 'file');
+      if (!src) {
+        content = (
+          <div className="text-xs text-amber-300/90 italic flex items-center gap-1.5 mt-1">
+            <ShieldAlert size={12} /> Attachment blocked — not a recognised file format
+          </div>
+        );
+      } else if (msg.type === 'image') {
+        content = <img src={src} alt={name || 'Attachment'} className="max-w-[240px] max-h-[240px] rounded-md border border-white/10 mt-1 object-cover" />;
       } else if (msg.type === 'audio') {
-        content = <audio controls src={data} className="w-[200px] h-8 outline-none mt-1" />;
+        content = <audio controls src={src} className="w-[200px] h-8 outline-none mt-1" />;
       } else {
         // Previously a received file had no filename and no way to open it —
         // the decrypted bytes just sat in the bubble, unreachable.
         content = (
-          <a href={data} download={name || 'qchat-attachment'}
+          <a href={src} download={name || 'qchat-attachment'}
              className="flex items-center gap-2 bg-black/20 hover:bg-black/30 transition-colors p-2 rounded-md mt-1">
             <File size={16} />
             <span className="text-xs truncate max-w-[160px]">{name || 'Secure File Attachment'}</span>
@@ -1638,6 +1849,14 @@ export default function ChatDashboard() {
                   <p className="text-[10px] font-mono text-slate-500 truncate">{u.qchatId || '—'}</p>
                 )}
               </div>
+              {u.unread > 0 && peer?.id !== String(u.id) && (
+                <span
+                  className="min-w-[18px] h-[18px] px-1 rounded-full bg-cyan-400 text-navy-950 text-[10px] font-bold flex items-center justify-center flex-shrink-0"
+                  aria-label={`${u.unread} unread`}
+                >
+                  {u.unread > 99 ? '99+' : u.unread}
+                </span>
+              )}
               <button
                 type="button" onClick={(e) => removeContact(u, e)} title={`Remove ${u.username}`}
                 className="opacity-0 group-hover/row:opacity-100 focus:opacity-100 p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-white/5 transition-all flex-shrink-0"
@@ -1696,7 +1915,7 @@ export default function ChatDashboard() {
               <div className="flex items-center gap-2 flex-shrink-0">
                 {integrity && (
                   <span
-                    title={`Transcript digest: ${integrity}\nEvery message in this thread hashes to this value. If it matches on both devices, neither transcript has been altered.`}
+                    title={`Transcript digest: ${formatDigest(integrity, 8)}\nA SHA-256 chain over the messages loaded here (sender, id, time, text). With the same messages loaded, both devices show the same value; an altered, missing or reordered message changes it.`}
                     className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wide
                                text-emerald-300/90 bg-emerald-400/[0.08] border border-emerald-400/20
                                px-2.5 py-1 rounded-full mr-1 cursor-default"
@@ -1735,14 +1954,14 @@ export default function ChatDashboard() {
                 <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="absolute inset-0 z-50 bg-navy-950/95 backdrop-blur-md flex flex-col">
                   {callStatus === 'receiving' ? (
                     <div className="flex-1 flex flex-col items-center justify-center">
-                      <div className={`w-24 h-24 rounded-full bg-gradient-to-br ${avatarGrad(peer.username)} flex items-center justify-center font-bold text-4xl text-white mb-6 animate-pulse`}>
-                        {peer.username[0].toUpperCase()}
+                      <div className={`w-24 h-24 rounded-full bg-gradient-to-br ${avatarGrad((callPeer || peer).username)} flex items-center justify-center font-bold text-4xl text-white mb-6 animate-pulse`}>
+                        {(callPeer || peer).username[0].toUpperCase()}
                       </div>
-                      <h2 className="text-2xl font-bold mb-2">{peer.username} is calling...</h2>
+                      <h2 className="text-2xl font-bold mb-2">{(callPeer || peer).username} is calling…</h2>
                       <p className="text-cyan-400 flex items-center gap-2 mb-8"><Lock size={14}/> ML-KEM-768 Secured</p>
                       <div className="flex gap-6">
-                        <button onClick={cleanupCall} className="w-14 h-14 rounded-full bg-rose-500 hover:bg-rose-600 flex items-center justify-center shadow-lg shadow-rose-500/20"><PhoneOff size={24} className="text-white"/></button>
-                        <button onClick={acceptCall} className="w-14 h-14 rounded-full bg-emerald-500 hover:bg-emerald-600 flex items-center justify-center shadow-lg shadow-emerald-500/20"><Video size={24} className="text-white"/></button>
+                        <button onClick={declineCall} aria-label="Decline call" className="w-14 h-14 rounded-full bg-rose-500 hover:bg-rose-600 flex items-center justify-center shadow-lg shadow-rose-500/20"><PhoneOff size={24} className="text-white"/></button>
+                        <button onClick={acceptCall} aria-label="Accept call" className="w-14 h-14 rounded-full bg-emerald-500 hover:bg-emerald-600 flex items-center justify-center shadow-lg shadow-emerald-500/20"><Video size={24} className="text-white"/></button>
                       </div>
                     </div>
                   ) : (

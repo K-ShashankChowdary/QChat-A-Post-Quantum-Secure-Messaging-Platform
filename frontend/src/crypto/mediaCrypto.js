@@ -115,16 +115,22 @@ export async function decryptFrame(frame, key) {
 }
 
 /**
+ * `control.sealed` can be switched off mid-call (see createMediaCrypto.disable).
+ *
  * A frame that fails to open is dropped, not passed through. Passing it would
  * hand the decoder ciphertext and produce a corrupt picture that looks like a
  * network fault rather than a security one. Dropping shows a freeze, which is
  * the honest signal.
  */
-export function makeTransform(key, mode, onError, onFirst) {
+export function makeTransform(key, mode, onError, onFirst, control = { sealed: true }) {
   let failures = 0;
   let seen = 0;
   return new TransformStream({
     async transform(frame, controller) {
+      // The far end turned out not to seal frames. Both directions then pass
+      // through untouched (still under DTLS-SRTP), rather than one side sending
+      // ciphertext the other can't open.
+      if (!control.sealed) { controller.enqueue(frame); return; }
       try {
         controller.enqueue(mode === 'encrypt'
           ? await encryptFrame(frame, key)

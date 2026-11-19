@@ -1,4 +1,5 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import { User, Message } from '../db/database.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
@@ -95,9 +96,19 @@ router.get('/', authenticateToken, async (req, res) => {
 
     if (ids.size === 0) return res.json([]);
 
-    const users = await User.find({ _id: { $in: [...ids] } }).select(PUBLIC_FIELDS);
+    // Unread counts per contact, so a message that arrived while you were away
+    // (or in another chat) is visible in the list instead of only in a log.
+    const [users, unreadRows] = await Promise.all([
+      User.find({ _id: { $in: [...ids] } }).select(PUBLIC_FIELDS),
+      Message.aggregate([
+        { $match: { to_user_id: new mongoose.Types.ObjectId(meId), read: false, deleted: { $ne: true } } },
+        { $group: { _id: '$from_user_id', count: { $sum: 1 } } },
+      ]),
+    ]);
+    const unread = new Map(unreadRows.map(r => [String(r._id), r.count]));
+
     logger.info('Contacts listed', { count: users.length, requestor: req.user.username }, CTX);
-    res.json(users.map(shape));
+    res.json(users.map(u => ({ ...shape(u), unread: unread.get(String(u._id)) || 0 })));
   } catch (error) {
     logger.error('Failed to fetch contacts', { message: error.message }, CTX);
     res.status(500).json({ error: 'Failed to fetch contacts' });

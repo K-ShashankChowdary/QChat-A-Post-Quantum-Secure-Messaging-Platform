@@ -13,6 +13,8 @@ import userRoutes from './routes/users.js';
 import { authenticateSocket } from './middleware/auth.js';
 import { logger } from './utils/logger.js';
 import { isValidObjectId, approximateSize } from './utils/validation.js';
+import { serializeMessage } from './utils/serialize.js';
+import mongoose from 'mongoose';
 
 // ── Connect to MongoDB ──
 connectDB()
@@ -36,6 +38,38 @@ const ALLOWED_MESSAGE_TYPES = ['text', 'image', 'audio', 'file'];
  * every tab receives their messages.
  */
 const isUserOnline = (userId) => (io.sockets.adapter.rooms.get(String(userId))?.size ?? 0) > 0;
+
+/**
+ * Everyone with a reason to see this user's presence: their contacts, anyone
+ * who has them as a contact, and anyone they share a conversation with.
+ * Presence used to go to every connected socket, which told every account on
+ * the server who was online and when.
+ */
+async function presenceAudience(userId) {
+  const [me, addedBy, receivedFrom, sentTo] = await Promise.all([
+    User.findById(userId).select('contacts').lean(),
+    User.find({ contacts: userId }).distinct('_id'),
+    Message.distinct('from_user_id', { to_user_id: userId }),
+    Message.distinct('to_user_id', { from_user_id: userId }),
+  ]);
+  const ids = new Set([...(me?.contacts || []), ...addedBy, ...receivedFrom, ...sentTo].map(String));
+  ids.delete(String(userId));
+  return [...ids];
+}
+
+async function broadcastPresence(userId, status, lastSeen) {
+  const audience = await presenceAudience(userId);
+  if (audience.length > 0) io.to(audience).emit('user_status', { userId, status, lastSeen });
+}
+
+/** Do these two accounts know each other — a contact link either way, or history? */
+async function areConnected(a, b) {
+  const [link, history] = await Promise.all([
+    User.exists({ $or: [{ _id: a, contacts: b }, { _id: b, contacts: a }] }),
+    Message.exists({ $or: [{ from_user_id: a, to_user_id: b }, { from_user_id: b, to_user_id: a }] }),
+  ]);
+  return Boolean(link || history);
+}
 
 // ── Security headers ──
 app.use(helmet());
@@ -77,6 +111,10 @@ const lookupLimiter = rateLimit({
   message: { error: 'Too many lookups, slow down a moment' },
 });
 
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, db: mongoose.connection.readyState === 1 ? 'up' : 'down' });
+});
+
 app.use('/api/auth',         authLimiter, authRoutes);
 app.use('/api/messages',     messageRoutes);
 app.use('/api/users/lookup', lookupLimiter);
@@ -90,18 +128,7 @@ async function deliverPendingMessages(socket, userId) {
   if (pending.length === 0) return;
 
   logger.info(`Delivering ${pending.length} offline message(s)`, { userId }, 'Socket');
-  for (const msg of pending) {
-    socket.emit('new_message', {
-      id:        msg._id,
-      fromId:    msg.from_user_id,
-      payload:   msg.payload,
-      timestamp: msg.timestamp,
-      type:      msg.type,
-      replyToId: msg.reply_to_id,
-      deleted:   msg.deleted,
-      reactions: msg.reactions,
-    });
-  }
+  for (const msg of pending) socket.emit('new_message', serializeMessage(msg));
 
   await Message.updateMany(
     { _id: { $in: pending.map(m => m._id) } },
@@ -127,18 +154,22 @@ io.on('connection', async (socket) => {
 
   logger.event('Socket connected', { socketId: socket.id, userId, username: socket.user.username }, 'Socket');
 
-  try {
-    await User.findByIdAndUpdate(userId, { is_online: true, last_seen: new Date() });
-    io.emit('user_status', { userId, status: 'online', lastSeen: new Date() });
-    await deliverPendingMessages(socket, userId);
-  } catch (err) {
-    logger.error('Connection setup failed', { message: err.message, userId }, 'Socket');
-  }
+  // Typing indicators and call signals are relayed only between accounts that
+  // already know each other, so an arbitrary user id can't be rung or spammed.
+  // Positive answers are cached for the life of the socket.
+  const reachable = new Set();
+  const canReach = async (toId) => {
+    if (!isValidObjectId(toId) || String(toId) === userId) return false;
+    const key = String(toId);
+    if (reachable.has(key)) return true;
+    if (await areConnected(userId, key)) { reachable.add(key); return true; }
+    return false;
+  };
 
   socket.on('send_message', async ({ tempId, toId, payload, senderPayload, type, replyToId }) => {
     logger.event('Relay message', { fromId: userId, toId }, 'Socket');
     try {
-      if (!isValidObjectId(toId)) {
+      if (!isValidObjectId(toId) || String(toId) === userId) {
         return socket.emit('message_error', { tempId, error: 'INVALID_RECIPIENT' });
       }
       if (!payload || typeof payload !== 'object') {
@@ -155,6 +186,10 @@ io.on('connection', async (socket) => {
       // A non-ObjectId reply target (e.g. a client-side temp id) would throw on
       // save and lose the message entirely, so drop it instead.
       const safeReplyTo = isValidObjectId(replyToId) ? replyToId : null;
+      // A message to an id with no account would sit undelivered forever.
+      if (!(await User.exists({ _id: toId }))) {
+        return socket.emit('message_error', { tempId, error: 'INVALID_RECIPIENT' });
+      }
       const recipientOnline = isUserOnline(toId);
 
       const msg = new Message({
@@ -168,6 +203,7 @@ io.on('connection', async (socket) => {
       });
       await msg.save();
       logger.info('Message saved', { id: msg._id, fromId: userId, toId }, 'Socket');
+      reachable.add(String(toId));
 
       // Hand the real id back so the sender's optimistic bubble stops carrying a
       // temporary one — receipts, deletes, reactions and replies all key off it.
@@ -179,10 +215,7 @@ io.on('connection', async (socket) => {
       });
 
       if (recipientOnline) {
-        io.to(String(toId)).emit('new_message', {
-          id: msg._id, fromId: userId, payload, timestamp: msg.timestamp,
-          type: msg.type, replyToId: msg.reply_to_id, deleted: msg.deleted, reactions: msg.reactions,
-        });
+        io.to(String(toId)).emit('new_message', serializeMessage(msg));
         logger.event('Message delivered', { toId }, 'Socket');
       } else {
         logger.warn('Recipient offline — message persisted for delivery on reconnect', { toId }, 'Socket');
@@ -193,21 +226,29 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('webrtc_signal', ({ toId, signalPayload }) => {
-    if (!isValidObjectId(toId)) return;
-    logger.event('Relay WebRTC signal', { fromId: userId, toId }, 'Socket');
-    io.to(String(toId)).emit('webrtc_signal', { fromId: userId, signalPayload });
+  socket.on('webrtc_signal', async ({ toId, signalPayload } = {}) => {
+    try {
+      if (!signalPayload || typeof signalPayload !== 'object') return;
+      if (approximateSize(signalPayload) > 64 * 1024) return;
+      if (!(await canReach(toId))) {
+        return logger.warn('webrtc_signal: no relationship with recipient', { fromId: userId, toId }, 'Socket');
+      }
+      logger.event('Relay WebRTC signal', { fromId: userId, toId }, 'Socket');
+      io.to(String(toId)).emit('webrtc_signal', { fromId: userId, signalPayload });
+    } catch (err) {
+      logger.error('webrtc_signal failed', { message: err.message }, 'Socket');
+    }
   });
 
-  socket.on('typing', ({ toId }) => {
-    if (!isValidObjectId(toId)) return;
-    io.to(String(toId)).emit('typing', { fromId: userId });
-  });
-
-  socket.on('stop_typing', ({ toId }) => {
-    if (!isValidObjectId(toId)) return;
-    io.to(String(toId)).emit('stop_typing', { fromId: userId });
-  });
+  const relayTyping = (event) => async ({ toId } = {}) => {
+    try {
+      if (await canReach(toId)) io.to(String(toId)).emit(event, { fromId: userId });
+    } catch (err) {
+      logger.error(`${event} failed`, { message: err.message }, 'Socket');
+    }
+  };
+  socket.on('typing', relayTyping('typing'));
+  socket.on('stop_typing', relayTyping('stop_typing'));
 
   socket.on('message_read', async ({ messageIds, toId }) => {
     try {
@@ -236,7 +277,7 @@ io.on('connection', async (socket) => {
       // Ownership is enforced in the query: only the sender can delete.
       const msg = await Message.findOneAndUpdate(
         { _id: messageId, from_user_id: userId },
-        { $set: { deleted: true, payload: {}, sender_payload: {} } },
+        { $set: { deleted: true, payload: {}, sender_payload: {}, reactions: [] } },
         { new: true }
       );
       if (!msg) {
@@ -259,26 +300,34 @@ io.on('connection', async (socket) => {
       if (payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) return;
       if (approximateSize(payload) > 64 * 1024) return;
 
-      const msg = await Message.findById(messageId);
-      if (!msg) return;
-
-      const participants = [String(msg.from_user_id), String(msg.to_user_id)];
-      if (!participants.includes(userId)) {
-        return logger.warn('message_reaction: not a participant', { messageId, userId }, 'Socket');
+      // Only a participant may react, and not to a deleted message.
+      const scope = {
+        _id: messageId,
+        deleted: { $ne: true },
+        $or: [{ from_user_id: userId }, { to_user_id: userId }],
+      };
+      const msg = await Message.findOne(scope).select('from_user_id to_user_id').lean();
+      if (!msg) {
+        return logger.warn('message_reaction: not found, deleted, or not a participant', { messageId, userId }, 'Socket');
       }
 
-      const existing = msg.reactions.findIndex(r => String(r.user_id) === userId);
-      if (existing >= 0) msg.reactions.splice(existing, 1);
-      if (payload) msg.reactions.push({ user_id: userId, payload });
-      await msg.save();
+      // Two atomic updates rather than load-modify-save. Saving the whole array
+      // raced: when both people reacted at once, the second save failed its
+      // version check and that reaction silently vanished.
+      await Message.updateOne(scope, { $pull: { reactions: { user_id: userId } } });
+      if (payload) {
+        // The $ne guard stops a fast double-tap leaving two rows for one user.
+        await Message.updateOne(
+          { ...scope, 'reactions.user_id': { $ne: userId } },
+          { $push: { reactions: { user_id: userId, payload } } },
+        );
+      }
 
       // Broadcast the authoritative array; clients replace rather than append,
       // which is what stops a reaction being counted twice on the sender's side.
-      // Named `update`, not `payload`: a `const payload` here is block-scoped to
-      // this try, so it shadows the handler's own `payload` argument and puts
-      // every earlier read of it in the temporal dead zone.
-      const update = { messageId, reactions: msg.reactions };
-      for (const participant of new Set(participants)) {
+      const fresh = await Message.findById(messageId).select('reactions').lean();
+      const update = { messageId, reactions: fresh?.reactions || [] };
+      for (const participant of new Set([String(msg.from_user_id), String(msg.to_user_id)])) {
         io.to(participant).emit('message_reaction', update);
       }
     } catch (err) {
@@ -296,11 +345,26 @@ io.on('connection', async (socket) => {
     try {
       const lastSeen = new Date();
       await User.findByIdAndUpdate(userId, { is_online: false, last_seen: lastSeen });
-      io.emit('user_status', { userId, status: 'offline', lastSeen });
+      await broadcastPresence(userId, 'offline', lastSeen);
     } catch (err) {
       logger.error('Failed to record disconnect', { message: err.message, userId }, 'Socket');
     }
   });
+
+  // Setup runs after every handler is registered. It used to run first, and
+  // because it awaits the database, anything the client emitted straight after
+  // connecting arrived while no handler existed and was silently dropped.
+  try {
+    // A socket that dropped before setup ran must not mark its user online
+    // after the disconnect handler has already marked them offline.
+    if (socket.disconnected) return;
+    const now = new Date();
+    await User.findByIdAndUpdate(userId, { is_online: true, last_seen: now });
+    await broadcastPresence(userId, 'online', now);
+    await deliverPendingMessages(socket, userId);
+  } catch (err) {
+    logger.error('Connection setup failed', { message: err.message, userId }, 'Socket');
+  }
 });
 
 io.engine.on('connection_error', (err) => {
@@ -316,3 +380,18 @@ app.use((err, req, res, _next) => {
 httpServer.listen(config.port, () => {
   logger.info(`QChat backend running`, { port: config.port, env: config.nodeEnv, cors: config.corsOrigin }, 'Server');
 });
+
+// Close sockets and the database cleanly on Ctrl-C or a container stop, so
+// clients see a disconnect (and reconnect) instead of a hung connection.
+let shuttingDown = false;
+const shutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.warn(`${signal} received — shutting down`, null, 'Server');
+  io.close(() => {
+    mongoose.connection.close().finally(() => process.exit(0));
+  });
+  setTimeout(() => process.exit(1), 5000).unref();
+};
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

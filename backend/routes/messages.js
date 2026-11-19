@@ -3,6 +3,7 @@ import { Message } from '../db/database.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
 import { isValidObjectId } from '../utils/validation.js';
+import { serializeMessage } from '../utils/serialize.js';
 
 const router = express.Router();
 const CTX = 'Messages';
@@ -27,12 +28,13 @@ router.get('/:peerId', authenticateToken, async (req, res) => {
   // Paging backwards by offset skews when live messages arrive mid-scroll (they
   // shift the window and a page gets skipped), so prefer a timestamp cursor and
   // keep offset only as a fallback.
-  const filter = {
+  const conversation = {
     $or: [
       { from_user_id: currentUserId, to_user_id: peerId },
       { from_user_id: peerId, to_user_id: currentUserId },
     ],
   };
+  let filter = conversation;
 
   let before = null;
   if (req.query.before) {
@@ -40,15 +42,26 @@ router.get('/:peerId', authenticateToken, async (req, res) => {
     if (Number.isNaN(parsed.getTime())) {
       return res.status(400).json({ error: 'Invalid "before" cursor' });
     }
+    const { beforeId } = req.query;
+    if (beforeId !== undefined && !isValidObjectId(beforeId)) {
+      return res.status(400).json({ error: 'Invalid "beforeId" cursor' });
+    }
     before = parsed;
-    filter.timestamp = { $lt: parsed };
+    // Two messages can share a millisecond, and a bare "timestamp < cursor"
+    // skipped whichever of them fell on the far side of a page boundary. The
+    // cursor is (timestamp, _id): strictly older, or the same instant with a
+    // smaller id — matching the sort below exactly.
+    const older = beforeId
+      ? { $or: [{ timestamp: { $lt: parsed } }, { timestamp: parsed, _id: { $lt: beforeId } }] }
+      : { timestamp: { $lt: parsed } };
+    filter = { $and: [conversation, older] };
   }
 
   logger.info('Fetch history', { currentUserId, peerId, limit, offset, before }, CTX);
 
   try {
     const messages = await Message.find(filter)
-      .sort({ timestamp: -1 })
+      .sort({ timestamp: -1, _id: -1 })
       .skip(before ? 0 : offset)
       .limit(limit);
 
@@ -57,22 +70,7 @@ router.get('/:peerId', authenticateToken, async (req, res) => {
 
     logger.info(`Returned ${messages.length} messages`, { peerId }, CTX);
 
-    res.json(
-      messages.map((msg) => ({
-        id: msg._id,
-        fromId: msg.from_user_id,
-        toId: msg.to_user_id,
-        payload: msg.payload,
-        senderPayload: msg.sender_payload,
-        timestamp: msg.timestamp,
-        delivered: msg.delivered,
-        read: msg.read,
-        replyToId: msg.reply_to_id,
-        deleted: msg.deleted,
-        type: msg.type,
-        reactions: msg.reactions,
-      }))
-    );
+    res.json(messages.map((msg) => serializeMessage(msg, { includeSenderPayload: true })));
   } catch (error) {
     logger.error('Fetch history failed', { message: error.message }, CTX);
     res.status(500).json({ error: 'Failed to fetch messages' });

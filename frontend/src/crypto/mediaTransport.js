@@ -34,6 +34,9 @@ export async function createMediaCrypto({ masterSecret, isInitiator, onError, on
 
   let worker = null;
   let keys = null;
+  // Shared by every transform this call creates; flipped off if the peer
+  // answers that it cannot seal frames.
+  const control = { sealed: true };
   // Which directions actually got a transform wired. The caller uses this
   // rather than API presence, so the UI can never claim media is sealed when
   // attachment failed and the frames are going out in the clear.
@@ -58,13 +61,14 @@ export async function createMediaCrypto({ masterSecret, isInitiator, onError, on
           masterSecret,
           isInitiator,
         });
+        attached[mode] = true;
         return;
       }
 
       const streams = rtpObject.createEncodedStreams();
       const key = mode === 'encrypt' ? keys.encryptKey : keys.decryptKey;
       streams.readable
-        .pipeThrough(makeTransform(key, mode, onError, onFirst))
+        .pipeThrough(makeTransform(key, mode, onError, onFirst, control))
         .pipeTo(streams.writable)
         .catch(() => { /* call ended; the pipe closing here is expected */ });
       attached[mode] = true;
@@ -78,6 +82,11 @@ export async function createMediaCrypto({ masterSecret, isInitiator, onError, on
     attached,
     applyToSender: (sender) => attach(sender, 'encrypt'),
     applyToReceiver: (receiver) => attach(receiver, 'decrypt'),
+    /** Stop sealing and opening — the peer can't, so plain SRTP both ways. */
+    disable: () => {
+      control.sealed = false;
+      worker?.postMessage({ type: 'passthrough' });
+    },
     close: () => worker?.terminate(),
   };
 }

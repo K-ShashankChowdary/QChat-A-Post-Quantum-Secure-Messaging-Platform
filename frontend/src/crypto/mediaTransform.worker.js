@@ -9,6 +9,12 @@
 import { deriveMediaKeys, makeTransform } from './mediaCrypto';
 
 let keysPromise = null;
+// Mirrors the main-thread control object: the page posts 'passthrough' when the
+// peer can't seal frames.
+const control = { sealed: true };
+self.onmessage = (e) => {
+  if (e.data?.type === 'passthrough') control.sealed = false;
+};
 
 /** Keys are derived once per worker and shared by every track it handles. */
 function keysFor(masterSecret, isInitiator) {
@@ -25,7 +31,15 @@ self.onrtctransform = async (event) => {
   const key = mode === 'encrypt' ? encryptKey : decryptKey;
 
   transformer.readable
-    .pipeThrough(makeTransform(key, mode, (info) => self.postMessage({ type: 'media-crypto-error', ...info })))
+    .pipeThrough(makeTransform(
+      key,
+      mode,
+      (info) => self.postMessage({ type: 'media-crypto-error', ...info }),
+      // Without this the page never learns a frame opened, and the call badge
+      // sat on "Negotiating…" for the whole call on Firefox and Safari.
+      (info) => self.postMessage({ type: 'media-crypto-first', ...info }),
+      control,
+    ))
     .pipeTo(transformer.writable)
     .catch(() => { /* the call ended and the pipe closed; nothing to recover */ });
 };

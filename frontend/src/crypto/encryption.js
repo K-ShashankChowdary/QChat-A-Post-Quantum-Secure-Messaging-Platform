@@ -14,7 +14,7 @@ export async function generateKeyPair() {
   }
 }
 
-// Hashes the shared secret and imports it as a raw 256-bit AES-GCM key
+// v1 only: hashes the shared secret and imports it as a raw 256-bit AES-GCM key
 async function deriveAESKey(sharedSecret) {
   try {
     const hash = await crypto.subtle.digest('SHA-256', sharedSecret);
@@ -31,50 +31,10 @@ async function deriveAESKey(sharedSecret) {
   }
 }
 
-// Wraps a message in ML-KEM + AES-256-GCM hybrid encryption
-export async function encryptMessage(text, recipientPublicKey) {
-  if (!text) throw new Error('EMPTY_MESSAGE');
-  if (!recipientPublicKey || recipientPublicKey.byteLength !== 1184) {
-    throw new Error(`INVALID_PUBLIC_KEY: expected 1184 bytes, got ${recipientPublicKey?.byteLength}`);
-  }
-
-  try {
-    // Encapsulate against recipient public key to generate the shared secret
-    const { sharedSecret, cipherText: encapsulatedKey } = ml_kem768.encapsulate(recipientPublicKey);
-
-    // Swap the shared secret for an AES key
-    const aesKey = await deriveAESKey(sharedSecret);
-
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const encoder = new TextEncoder();
-    const encodedData = encoder.encode(text);
-
-    // Encrypt the payload
-    const encryptedBuffer = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      aesKey,
-      encodedData
-    );
-
-    // AES-GCM appends a 16-byte auth tag at the end of the ciphertext buffer. Need to split them.
-    const encryptedArray = new Uint8Array(encryptedBuffer);
-    const ciphertext = encryptedArray.slice(0, -16);
-    const authTag = encryptedArray.slice(-16);
-
-    return {
-      encapsulatedKey: b64encode(encapsulatedKey),
-      nonce: b64encode(iv),
-      ciphertext: b64encode(ciphertext),
-      authTag: b64encode(authTag),
-      timestamp: Date.now()
-    };
-  } catch (error) {
-    console.error('Encryption failed:', error);
-    throw new Error('ENCRYPTION_FAILED');
-  }
-}
-
-// Decrypts payload by decapsulating the shared secret and unwrapping the AES cipher
+/* ─── Payload v1 (read-only) ───
+   Nothing writes v1 any more, but stored history still holds it, so it must
+   keep opening. v1 used a bare SHA-256 of the shared secret as the AES key and
+   carried one encapsulation per payload. */
 export async function decryptMessage(payload, myPrivateKey) {
   if (!payload || !payload.encapsulatedKey || !payload.nonce || !payload.ciphertext || !payload.authTag) {
     throw new Error('INVALID_PAYLOAD_STRUCTURE');
@@ -358,27 +318,43 @@ export async function keyFingerprint(publicKey) {
     .join(' ');
 }
 
-// Builds a rolling SHA-256 hash chain of the conversation history
-export async function calculateIntegrity(messages) {
-  if (!messages || messages.length === 0) return '0x0000...';
-  
-  try {
-    let currentHash = new Uint8Array(32);
-    const encoder = new TextEncoder();
+/* ─── Integrity chain ───
+     H_0 = 0^256
+     H_n = SHA-256( H_{n-1} ‖ encode(sender_n, id_n, time_n, text_n) )
 
-    for (const msg of messages) {
-      // Concat previous hash with current message data (including direction)
-      const direction = msg.isMine ? 'out' : 'in';
-      const data = encoder.encode(msg.text + msg.timestamp + direction);
-      const combined = new Uint8Array(currentHash.length + data.length);
-      combined.set(currentHash);
-      combined.set(data, currentHash.length);
-      
-      const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-      currentHash = new Uint8Array(hashBuffer);
+   Every input is something both participants hold identically: the sender's
+   user id rather than "mine / theirs", and the server's message id and
+   timestamp rather than a local clock. So two devices with the same messages
+   loaded compute the same digest, and comparing them is a real check. (The
+   first version hashed 'out' on one side and 'in' on the other, so the two
+   could never agree.)
+
+   encode() is a JSON array, which is unambiguous where bare concatenation is
+   not: "ab" + "c" and "a" + "bc" would otherwise hash identically.
+
+   `entries` is [{ from, id, timestamp, text }]. It is put into canonical
+   (time, id) order here, so arrival order on either device can't matter. */
+export async function calculateIntegrity(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  try {
+    const ordered = entries
+      .map(e => ({ ...e, time: new Date(e.timestamp).toISOString() }))
+      .sort((a, b) => (a.time === b.time
+        ? (String(a.id) < String(b.id) ? -1 : 1)
+        : (a.time < b.time ? -1 : 1)));
+
+    const encoder = new TextEncoder();
+    let current = new Uint8Array(32);
+    for (const e of ordered) {
+      const record = encoder.encode(JSON.stringify([String(e.from), String(e.id), e.time, String(e.text ?? '')]));
+      const combined = new Uint8Array(current.length + record.length);
+      combined.set(current);
+      combined.set(record, current.length);
+      current = new Uint8Array(await crypto.subtle.digest('SHA-256', combined));
     }
 
-    return b64encode(currentHash).slice(0, 16) + '...';
+    return [...current].map(b => b.toString(16).padStart(2, '0')).join('');
   } catch (error) {
     console.error('Integrity check failed:', error);
     throw new Error('INTEGRITY_CALCULATION_FAILED');

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import api from '../lib/api';
+import api, { clearSession } from '../lib/api';
 import { useNavigate } from 'react-router-dom';
 import {
   generateKeyPair, b64encode, b64decode,
@@ -32,7 +32,11 @@ export default function Login() {
       const privKeyName = `qchat_priv_${data.user.id}`;
       const pubKeyName  = `qchat_pub_${data.user.id}`;
       const existingPriv = localStorage.getItem(privKeyName);
-      const existingPub  = localStorage.getItem(pubKeyName);
+      // The public key is read out of the private key rather than trusted from
+      // storage: FIPS 203 embeds it, so a device that lost the public half (or
+      // holds a stale one) still recovers instead of minting a new keypair.
+      const derivedPub   = existingPriv ? publicKeyFromSecretKey(b64decode(existingPriv)) : null;
+      const existingPub  = derivedPub ? b64encode(derivedPub) : null;
 
       let publicKeyB64;
 
@@ -54,6 +58,7 @@ export default function Login() {
         // Account predates backups but this device still holds the real key —
         // upload a backup now so no future sign-in has to regenerate.
         publicKeyB64 = existingPub;
+        localStorage.setItem(pubKeyName, existingPub);
         setStage('Backing up your key…');
         try {
           const keyBackup = await wrapPrivateKey(b64decode(existingPriv), password);
@@ -77,8 +82,7 @@ export default function Login() {
         });
 
         if (!proceed) {
-          localStorage.removeItem('qchat_token');
-          localStorage.removeItem('qchat_user');
+          clearSession();
           setError('Sign-in cancelled — no new key was created.');
           return;
         }
@@ -100,6 +104,10 @@ export default function Login() {
       localStorage.setItem('qchat_user', JSON.stringify({ ...data.user, publicKey: publicKeyB64 }));
       navigate('/chat');
     } catch (err) {
+      // The token was stored the moment the password checked out. If key
+      // recovery then failed, keeping it left a session that could open /chat
+      // with no usable key — so a failed sign-in signs out completely.
+      clearSession();
       if (err.message === 'WRONG_PASSWORD') {
         // Login succeeded, so the password is right — the blob itself is bad.
         setError('Your key backup could not be opened. It may be corrupted; contact support or sign in on a device that still holds your key.');

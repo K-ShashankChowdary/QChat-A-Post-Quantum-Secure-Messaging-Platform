@@ -11,6 +11,37 @@ import { allocateQChatId } from '../utils/qchatId.js';
 const router = express.Router();
 const CTX = 'Auth';
 
+/* ── Per-account throttle ──
+   The IP limiter alone lets a guesser spread attempts across addresses and
+   hammer one account. This caps failures per username wherever they come from.
+   In-memory is enough for a single-node deployment. */
+const MAX_FAILURES = 5;
+const LOCK_WINDOW_MS = 15 * 60 * 1000;
+const failures = new Map();   // lower-cased username -> { count, first }
+
+const expired = (entry) => Date.now() - entry.first > LOCK_WINDOW_MS;
+
+function isLocked(key) {
+  const entry = failures.get(key);
+  if (!entry) return false;
+  if (expired(entry)) { failures.delete(key); return false; }
+  return entry.count >= MAX_FAILURES;
+}
+
+function recordFailure(key) {
+  const entry = failures.get(key);
+  if (!entry || expired(entry)) failures.set(key, { count: 1, first: Date.now() });
+  else entry.count++;
+  // Keep the map from growing without bound under a spray of random names.
+  if (failures.size > 10_000) {
+    for (const [k, v] of failures) if (expired(v)) failures.delete(k);
+  }
+}
+
+// Compared against when the username doesn't exist, so a miss costs the same
+// bcrypt time as a wrong password and timing can't reveal which it was.
+const DUMMY_HASH = bcrypt.hashSync('qchat-timing-equaliser', 10);
+
 const issueToken = (user) =>
   jwt.sign({ id: user._id, username: user.username }, config.jwtSecret, { expiresIn: config.jwtExpiresIn });
 
@@ -61,18 +92,24 @@ router.post('/login', async (req, res) => {
     return res.status(400).json({ error: 'Username and password are required' });
   }
 
+  const key = username.toLowerCase();
+  if (isLocked(key)) {
+    logger.warn('Login: account temporarily locked', { username }, CTX);
+    return res.status(429).json({ error: 'Too many failed attempts for this account. Try again in 15 minutes.' });
+  }
+
   try {
     const user = await User.findOne({ username });
-    if (!user) {
-      logger.warn('Login: user not found', { username }, CTX);
-      return res.status(401).json({ error: 'No account found with that username' });
-    }
+    const valid = await bcrypt.compare(password, user?.password_hash || DUMMY_HASH);
 
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      logger.warn('Login: wrong password', { username }, CTX);
-      return res.status(401).json({ error: 'Incorrect password' });
+    // One answer for both failures: separate messages told anyone which
+    // usernames exist.
+    if (!user || !valid) {
+      recordFailure(key);
+      logger.warn(user ? 'Login: wrong password' : 'Login: user not found', { username }, CTX);
+      return res.status(401).json({ error: 'Incorrect username or password' });
     }
+    failures.delete(key);
 
     logger.info('Login success', { username, id: user._id }, CTX);
     res.json({
