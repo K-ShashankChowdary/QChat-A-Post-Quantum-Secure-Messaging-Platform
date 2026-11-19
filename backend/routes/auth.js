@@ -12,21 +12,28 @@ const router = express.Router();
 const CTX = 'Auth';
 
 /* ── Per-account throttle ──
-   The IP limiter alone lets a guesser spread attempts across addresses and
-   hammer one account. This caps failures per username wherever they come from.
-   In-memory is enough for a single-node deployment. */
+   Two counters per username. A tight one per (username, address): five wrong
+   passwords from one place locks that place out. A loose one per username
+   across all addresses: a guesser spreading attempts over many IPs still hits
+   a ceiling. Keying only on the username would let anyone lock a victim out
+   of their own account with five bad guesses. In memory is enough for a
+   single-node deployment. */
 const MAX_FAILURES = 5;
+const MAX_FAILURES_ANY_SOURCE = 50;
 const LOCK_WINDOW_MS = 15 * 60 * 1000;
 const failures = new Map();   // lower-cased username -> { count, first }
 
 const expired = (entry) => Date.now() - entry.first > LOCK_WINDOW_MS;
 
-function isLocked(key) {
+function overLimit(key, limit) {
   const entry = failures.get(key);
   if (!entry) return false;
   if (expired(entry)) { failures.delete(key); return false; }
-  return entry.count >= MAX_FAILURES;
+  return entry.count >= limit;
 }
+
+const isLocked = (name, ip) =>
+  overLimit(`${name}|${ip}`, MAX_FAILURES) || overLimit(name, MAX_FAILURES_ANY_SOURCE);
 
 function recordFailure(key) {
   const entry = failures.get(key);
@@ -93,7 +100,8 @@ router.post('/login', async (req, res) => {
   }
 
   const key = username.toLowerCase();
-  if (isLocked(key)) {
+  const sourceKey = `${key}|${req.ip}`;
+  if (isLocked(key, req.ip)) {
     logger.warn('Login: account temporarily locked', { username }, CTX);
     return res.status(429).json({ error: 'Too many failed attempts for this account. Try again in 15 minutes.' });
   }
@@ -105,10 +113,12 @@ router.post('/login', async (req, res) => {
     // One answer for both failures: separate messages told anyone which
     // usernames exist.
     if (!user || !valid) {
+      recordFailure(sourceKey);
       recordFailure(key);
       logger.warn(user ? 'Login: wrong password' : 'Login: user not found', { username }, CTX);
       return res.status(401).json({ error: 'Incorrect username or password' });
     }
+    failures.delete(sourceKey);
     failures.delete(key);
 
     logger.info('Login success', { username, id: user._id }, CTX);

@@ -166,6 +166,12 @@ export async function verifyInclusion({ leaf, index, size, path, root }) {
    message is its own leaf, a difference names the message instead of only
    saying "something changed". */
 
+// Server timestamps are set when a message is constructed, not when it is
+// committed, so two messages sent in the same instant can land in either order.
+// A new message this close behind the last verified one is treated as new, not
+// as back-dated.
+export const INSERT_GRACE_MS = 5000;
+
 /**
  * Compare a saved checkpoint (old entries) with the current history.
  * Returns { status, findings, appended, prefixRoot }:
@@ -199,7 +205,7 @@ export async function compareWithCheckpoint(checkpoint, current) {
   let appended = 0;
   current.forEach((e, index) => {
     if (oldIds.has(String(e.id))) return;
-    if (new Date(e.timestamp).getTime() <= lastOld) {
+    if (new Date(e.timestamp).getTime() <= lastOld - INSERT_GRACE_MS) {
       findings.push({ kind: 'inserted', id: e.id, index, timestamp: e.timestamp });
     } else {
       appended++;

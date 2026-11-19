@@ -1,6 +1,9 @@
 import dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
 
-dotenv.config();
+// Resolved from this file, not the working directory, so scripts such as
+// `node backend/scripts/tamper.js` work from the repo root as well.
+dotenv.config({ path: fileURLToPath(new URL('../.env', import.meta.url)) });
 
 const PLACEHOLDER_SECRETS = [
   'change-me-to-a-long-random-secret',

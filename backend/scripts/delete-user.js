@@ -31,8 +31,8 @@ for (const username of usernames) {
     $or: [{ from_user_id: user._id }, { to_user_id: user._id }],
   });
   const contactRefs = await User.updateMany(
-    { contacts: user._id },
-    { $pull: { contacts: user._id } }
+    { $or: [{ contacts: user._id }, { 'hidden_contacts.user': user._id }] },
+    { $pull: { contacts: user._id, hidden_contacts: { user: user._id } } }
   );
   await User.deleteOne({ _id: user._id });
 

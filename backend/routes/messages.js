@@ -4,6 +4,7 @@ import { authenticateToken } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
 import { isValidObjectId } from '../utils/validation.js';
 import { serializeMessage } from '../utils/serialize.js';
+import { leafForMessage } from '../utils/merkleLeaf.js';
 
 const router = express.Router();
 const CTX = 'Messages';
@@ -34,6 +35,18 @@ router.get('/:peerId/leaves', authenticateToken, async (req, res) => {
       .limit(MAX_LEAVES)
       .select('from_user_id timestamp deleted leaf')
       .lean();
+
+    // A message saved without a leaf (by an older server, before the boot-time
+    // backfill ran) would leave a hole the client can't hash. Fill it now.
+    const missing = rows.filter(r => !r.leaf);
+    if (missing.length > 0) {
+      const full = await Message.find({ _id: { $in: missing.map(r => r._id) } })
+        .select('from_user_id timestamp deleted payload').lean();
+      const ops = full.map(m => ({ updateOne: { filter: { _id: m._id }, update: { $set: { leaf: leafForMessage(m) } } } }));
+      const byId = new Map(full.map(m => [String(m._id), leafForMessage(m)]));
+      for (const r of missing) r.leaf = byId.get(String(r._id)) || null;
+      if (ops.length) await Message.bulkWrite(ops);
+    }
 
     res.json({
       leaves: rows.map(r => ({

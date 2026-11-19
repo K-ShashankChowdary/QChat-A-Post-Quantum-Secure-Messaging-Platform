@@ -192,7 +192,7 @@ io.on('connection', async (socket) => {
       if (!(await User.exists({ _id: toId }))) {
         return socket.emit('message_error', { tempId, error: 'INVALID_RECIPIENT' });
       }
-      const recipientOnline = isUserOnline(toId);
+      const onlineBeforeSave = isUserOnline(toId);
 
       const msg = new Message({
         from_user_id:   userId,
@@ -201,7 +201,7 @@ io.on('connection', async (socket) => {
         sender_payload: senderPayload || null,
         type:           safeType,
         reply_to_id:    safeReplyTo,
-        delivered:      recipientOnline,
+        delivered:      onlineBeforeSave,
       });
       // _id and timestamp are assigned at construction, so the leaf can be
       // computed before the first save rather than with a second write.
@@ -209,6 +209,15 @@ io.on('connection', async (socket) => {
       await msg.save();
       logger.info('Message saved', { id: msg._id, fromId: userId, toId }, 'Socket');
       reachable.add(String(toId));
+
+      // The recipient may have connected while this was saving. Their offline
+      // flush ran before the message existed, so without a second look it would
+      // sit undelivered until their next reconnect.
+      const recipientOnline = isUserOnline(toId);
+      if (recipientOnline && !onlineBeforeSave) {
+        await Message.updateOne({ _id: msg._id }, { $set: { delivered: true } });
+        msg.delivered = true;
+      }
 
       // Hand the real id back so the sender's optimistic bubble stops carrying a
       // temporary one — receipts, deletes, reactions and replies all key off it.
@@ -267,20 +276,27 @@ io.on('connection', async (socket) => {
   socket.on('typing', relayTyping('typing'));
   socket.on('stop_typing', relayTyping('stop_typing'));
 
-  socket.on('message_read', async ({ messageIds, toId }) => {
+  socket.on('message_read', async ({ messageIds } = {}) => {
     try {
       const ids = (Array.isArray(messageIds) ? messageIds : []).filter(isValidObjectId);
       if (ids.length === 0) return;
 
       // Scoped to messages addressed to this user, so nobody can mark someone
       // else's conversation as read.
-      await Message.updateMany(
-        { _id: { $in: ids }, to_user_id: userId },
-        { $set: { read: true } }
-      );
+      const scope = { _id: { $in: ids }, to_user_id: userId };
+      await Message.updateMany(scope, { $set: { read: true } });
 
-      if (isValidObjectId(toId)) {
-        io.to(String(toId)).emit('message_read', { messageIds: ids, byUserId: userId });
+      // Tell the people who actually sent those messages, not whatever id the
+      // client named — that let a receipt be pushed at any account.
+      const rows = await Message.find(scope).select('_id from_user_id').lean();
+      const bySender = new Map();
+      for (const r of rows) {
+        const sender = String(r.from_user_id);
+        if (!bySender.has(sender)) bySender.set(sender, []);
+        bySender.get(sender).push(r._id);
+      }
+      for (const [sender, messageIds] of bySender) {
+        io.to(sender).emit('message_read', { messageIds, byUserId: userId });
       }
     } catch (err) {
       logger.error('Failed to update message read status', { message: err.message }, 'Socket');

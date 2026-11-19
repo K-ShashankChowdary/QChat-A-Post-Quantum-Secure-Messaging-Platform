@@ -196,6 +196,7 @@ export default function ChatDashboard() {
   const [compare, setCompare]           = useState(null);
   const [proofView, setProofView]       = useState(null);
   const compareWaitRef                  = useRef(null);
+  const lastCompareFromRef              = useRef(new Map());   // peer id -> time of their last request
   const transcriptRef                   = useRef(null);
   const [connStatus, setConnStatus]     = useState('connecting');
   
@@ -923,10 +924,11 @@ export default function ChatDashboard() {
       toast.error(error === 'PAYLOAD_TOO_LARGE'
         ? 'That attachment was too large to send.'
         : 'Your message could not be sent.');
+      // Flagged as a failed send, not as `error`: `error` means "couldn't be
+      // decrypted", and those are folded into the "encrypted to an earlier key"
+      // line — which is where a failed send used to vanish, mislabelled.
       setMessages(prev => prev.map(m =>
-        String(m.id) === String(tempId)
-          ? { ...m, error: true, text: error === 'PAYLOAD_TOO_LARGE' ? '[Not sent — attachment too large]' : '[Not sent]' }
-          : m
+        String(m.id) === String(tempId) ? { ...m, sendFailed: error || 'SEND_FAILED' } : m
       ));
     });
 
@@ -1065,6 +1067,11 @@ export default function ChatDashboard() {
       const rootAt = (size) => (open ? transcriptRef.current.rootAt(size) : fetchTranscriptRoot(from, size));
 
       if (msg.kind === 'request') {
+        // Answering means rebuilding a tree, so a contact can't make this
+        // device do it (or pop a toast) more than once every few seconds.
+        const last = lastCompareFromRef.current.get(from) || 0;
+        if (Date.now() - last < 3000) return;
+        lastCompareFromRef.current.set(from, Date.now());
         const sender = await findContact(from);
         if (!sender?.public_key) return;
         const mine = await rootAt(msg.size);
@@ -1410,6 +1417,18 @@ export default function ChatDashboard() {
       setEncrypting(false);
     }
   };
+
+  /** Send a failed message again — its sealed payload is still on the bubble. */
+  const retrySend = (msg) => {
+    const target = peerRef.current;
+    if (!target || !socketRef.current || !msg.payload) return;
+    setMessages(prev => prev.map(m => (m.id === msg.id ? { ...m, sendFailed: null } : m)));
+    socketRef.current.emit('send_message', {
+      tempId: msg.id, toId: target.id, payload: msg.payload, type: msg.type, replyToId: msg.replyToId,
+    });
+  };
+
+  const discardFailed = (id) => setMessages(prev => prev.filter(m => m.id !== id));
 
   const deleteMessage = async (messageId) => {
     if (!isRealId(messageId)) return toast.info('Still sending — try again in a moment.');
@@ -2226,7 +2245,7 @@ export default function ChatDashboard() {
 
                     // Hover actions, built once and placed inboard of the bubble on
                     // either side, so they never collide with the window edge.
-                    const actions = msg.deleted || msg.error ? null : (
+                    const actions = msg.deleted || msg.error || msg.sendFailed ? null : (
                       <div
                         data-reaction-ui
                         className={`flex items-center gap-1 self-center transition-opacity duration-150 ${
@@ -2296,7 +2315,7 @@ export default function ChatDashboard() {
                           <div className={[
                             msg.isMine ? 'bubble-mine' : 'bubble-theirs',
                             row.groupEnd ? (msg.isMine ? 'bubble-tail-mine' : 'bubble-tail-theirs') : '',
-                            msg.error ? 'bubble-error' : '',
+                            msg.error || msg.sendFailed ? 'bubble-error' : '',
                             freshIdsRef.current.has(String(msg.id)) ? 'bubble-arrive' : '',
                           ].filter(Boolean).join(' ')}>
                             {renderBubbleContent(msg)}
@@ -2304,7 +2323,16 @@ export default function ChatDashboard() {
 
                           {renderReactions(msg)}
 
-                          {row.groupEnd && (
+                          {msg.sendFailed ? (
+                            <div className="flex items-center gap-2 px-1 mt-1 text-[10px] font-semibold text-rose-300">
+                              <ShieldAlert size={11} />
+                              {msg.sendFailed === 'PAYLOAD_TOO_LARGE' ? 'Not sent — attachment too large' : 'Not sent'}
+                              {msg.sendFailed !== 'PAYLOAD_TOO_LARGE' && msg.payload && (
+                                <button type="button" onClick={() => retrySend(msg)} className="text-cyan-300 hover:text-cyan-200">Retry</button>
+                              )}
+                              <button type="button" onClick={() => discardFailed(msg.id)} className="text-slate-400 hover:text-slate-200">Discard</button>
+                            </div>
+                          ) : row.groupEnd && (
                             <div className={`flex items-center gap-1 px-1 ${msg.reactions?.length ? 'mt-1.5' : 'mt-1'}`}>
                               <span className="text-[10px] text-muted font-mono">{fmt(msg.timestamp)}</span>
                               {msg.isMine && !msg.deleted && (

@@ -117,31 +117,35 @@ test('checkpoint comparison names what changed', async () => {
     leaf: await leafForMessage({ fromId: 'u1', id, timestamp: t, payload: { text }, deleted }),
   });
   const old = sortEntries([
-    await mk('a', '2026-01-01T00:00:01Z', 'one'),
-    await mk('b', '2026-01-01T00:00:02Z', 'two'),
-    await mk('c', '2026-01-01T00:00:03Z', 'three'),
+    await mk('a', '2026-01-01T00:01:00Z', 'one'),
+    await mk('b', '2026-01-01T00:02:00Z', 'two'),
+    await mk('c', '2026-01-01T00:03:00Z', 'three'),
   ]);
   const checkpoint = { entries: old, root: await merkleRoot(old.map(e => e.leaf)) };
 
-  const same = await compareWithCheckpoint(checkpoint, [...old, await mk('d', '2026-01-01T00:00:04Z', 'four')]);
+  const same = await compareWithCheckpoint(checkpoint, [...old, await mk('d', '2026-01-01T00:04:00Z', 'four')]);
   assert.equal(same.status, 'ok');
   assert.equal(same.appended, 1);
   assert.equal(same.prefixRoot, checkpoint.root);
 
-  const edited = await compareWithCheckpoint(checkpoint, [old[0], await mk('b', '2026-01-01T00:00:02Z', 'TWO'), old[2]]);
+  const edited = await compareWithCheckpoint(checkpoint, [old[0], await mk('b', '2026-01-01T00:02:00Z', 'TWO'), old[2]]);
   assert.equal(edited.status, 'tampered');
   assert.deepEqual(edited.findings.map(f => [f.kind, f.id]), [['modified', 'b']]);
 
-  const retimed = await compareWithCheckpoint(checkpoint, sortEntries([old[0], await mk('b', '2026-01-01T00:00:09Z', 'two'), old[2]]));
+  const retimed = await compareWithCheckpoint(checkpoint, sortEntries([old[0], await mk('b', '2026-01-01T00:09:00Z', 'two'), old[2]]));
   assert.deepEqual(retimed.findings.map(f => [f.kind, f.id]), [['modified', 'b']]);
 
   const dropped = await compareWithCheckpoint(checkpoint, [old[0], old[2]]);
   assert.deepEqual(dropped.findings.map(f => [f.kind, f.id]), [['removed', 'b']]);
 
-  const backdated = await compareWithCheckpoint(checkpoint, sortEntries([...old, await mk('x', '2026-01-01T00:00:02.500Z', 'forged')]));
+  const backdated = await compareWithCheckpoint(checkpoint, sortEntries([...old, await mk('x', '2026-01-01T00:02:30Z', 'forged')]));
   assert.deepEqual(backdated.findings.map(f => [f.kind, f.id]), [['inserted', 'x']]);
 
-  const deleted = await compareWithCheckpoint(checkpoint, [old[0], await mk('b', '2026-01-01T00:00:02Z', '', true), old[2]]);
+  // A message a moment behind the last verified one is a race, not a forgery.
+  const racing = await compareWithCheckpoint(checkpoint, sortEntries([...old, await mk('r', '2026-01-01T00:02:58Z', 'racing')]));
+  assert.equal(racing.status, 'ok');
+
+  const deleted = await compareWithCheckpoint(checkpoint, [old[0], await mk('b', '2026-01-01T00:02:00Z', '', true), old[2]]);
   assert.equal(deleted.status, 'benign');
 
   assert.equal((await compareWithCheckpoint(null, old)).status, 'first');

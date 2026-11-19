@@ -39,22 +39,33 @@ const FINDING = {
 /** Header chip: status plus the first 8 hex chars of the root. */
 export function TranscriptBadge({ status, root, size, onClick }) {
   if (!status) return null;
+  // An empty conversation has nothing to verify — unless it became empty,
+  // which is exactly what a tampered (or cleared) history looks like.
+  if (size === 0 && status !== 'tampered' && status !== 'checking') return null;
   const { label, tone, Icon } = STATUS[status] || STATUS.checking;
   return (
     <button
       type="button"
       onClick={onClick}
+      aria-label={`${label}. Merkle root over ${size} message${size === 1 ? '' : 's'}. Open transcript integrity.`}
       title={`Merkle root over ${size} message${size === 1 ? '' : 's'} — click for details`}
-      className={`hidden md:inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wide border px-2.5 py-1 rounded-full mr-1 transition-colors ${TONE[tone]}`}
+      className={`inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wide border px-2 sm:px-2.5 py-1 rounded-full mr-1 transition-colors ${TONE[tone]}`}
     >
       <Icon size={11} className={status === 'checking' ? 'animate-spin' : ''} />
-      <span>{label}</span>
-      {root && <span className="font-mono tracking-[0.08em] opacity-80">{group(root.slice(0, 8))}</span>}
+      <span className="hidden sm:inline">{label}</span>
+      {root && <span className="hidden lg:inline font-mono tracking-[0.08em] opacity-80">{group(root.slice(0, 8))}</span>}
     </button>
   );
 }
 
 function Modal({ open, onClose, children, label }) {
+  React.useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') onClose?.(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
   return (
     <AnimatePresence>
       {open && (
@@ -95,7 +106,9 @@ export function TranscriptPanel({
     first: 'First verification on this device. The tree has been checkpointed; from now on any change to these messages will be detected and named.',
     ok: `Every message verified since ${checkpointAt ? when(checkpointAt) : 'the last visit'} is unchanged${appended ? `, and ${appended} new message${appended === 1 ? ' was' : 's were'} appended` : ''}.`,
     benign: 'Nothing was altered. The only changes since the last visit are deletions by the sender.',
-    tampered: 'This conversation no longer matches what this device verified before. The messages below were changed, removed or slipped in — by the server or by someone with access to its database.',
+    tampered: size === 0 && findings.length > 0 && findings.every(f => f.kind === 'removed')
+      ? `Every message this device had verified is gone. Either ${peerName} cleared the chat while you were away, or the server removed them. Accept the empty history only if you know it was cleared.`
+      : 'This conversation no longer matches what this device verified before. The messages below were changed, removed or slipped in — by the server or by someone with access to its database.',
     unavailable: 'The server did not return the transcript leaves, so this conversation could not be verified.',
   }[status];
 
