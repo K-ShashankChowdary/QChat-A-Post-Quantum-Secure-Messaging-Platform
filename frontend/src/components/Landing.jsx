@@ -6,7 +6,7 @@ import ScrambleText from './visuals/ScrambleText';
 import Logo from './visuals/Logo';
 import {
   ShieldCheck, ArrowRight, Lock, KeyRound, Cpu, MessageSquare,
-  Video, Paperclip, Fingerprint, UserPlus, Check, X, Server, Zap, ChevronDown
+  Video, Paperclip, Fingerprint, UserPlus, Check, X, Server, Zap, ChevronDown, Bot
 } from 'lucide-react';
 
 /* Card that tracks the cursor for a spotlight highlight. */
@@ -63,6 +63,7 @@ const FEATURES = [
   { icon: Video,         title: 'Peer-to-peer video calls', body: 'Media flows directly between devices over WebRTC. Signalling is post-quantum encrypted, and every audio and video frame is sealed with AES-256-GCM under a key agreed through ML-KEM — not only WebRTC\'s classical DTLS-SRTP.' },
   { icon: UserPlus,      title: 'Private by default',  body: 'No public directory. You are found only by a shareable QChat ID such as QC-8L99-2TVY, matched exactly — so the user base cannot be enumerated or probed for a username.' },
   { icon: Fingerprint,   title: 'Tamper-evident history', body: 'Every conversation is a Merkle tree. Your device remembers what it verified, names any message that was later changed, removed or back-dated, and can prove a single message belongs with a handful of hashes.' },
+  { icon: Bot,           title: 'On-device AI shield', body: 'A TensorFlow.js phishing model and a Transformers.js hate-speech model run in a Web Worker on your own device. Suspicious links and abuse are flagged before you send or read them — and the text is never shown to anyone else.' },
   { icon: ShieldCheck,   title: 'Hardened by default', body: 'Both the REST API and the socket layer authenticate independently, with rate limiting and strict input validation.' },
 ];
 
@@ -75,6 +76,7 @@ const SPEC = [
   ['Key derivation', 'HKDF-SHA256 · random salt + context string'],
   ['Content cipher', 'AES-256-GCM · 12-byte nonce · 16-byte tag'],
   ['Integrity', 'SHA-256 Merkle tree (RFC 6962)'],
+  ['Threat detection', 'TensorFlow.js phishing model · Transformers.js toxic-bert, on-device'],
   ['Messaging transport', 'Socket.io · JWT-authenticated handshake'],
   ['Call media', 'WebRTC · each frame AES-256-GCM under an ML-KEM key'],
 ];

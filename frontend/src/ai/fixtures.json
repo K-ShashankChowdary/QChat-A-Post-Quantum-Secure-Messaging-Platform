@@ -1,0 +1,38 @@
+{
+  "note": "Hand-written chat messages the trained models are checked against by `npm test`. None of these appear in the training data.",
+  "safeChat": [
+    "hey are we still meeting at 5?",
+    "send me the notes from todays class",
+    "lol that was hilarious",
+    "check out this repo https://github.com/facebook/react",
+    "here is the drive folder with our slides https://drive.google.com/drive/folders/1AbC",
+    "the exam is tomorrow at 9am, dont be late",
+    "can you pay me back the 200 for lunch",
+    "happy birthday!! have a great one",
+    "call me when you are free",
+    "ok",
+    "reached home, will text you later",
+    "did you finish the merkle tree part of the report?",
+    "my phone is about to die, ill call you back",
+    "mom says dinner at 8",
+    "the wifi in the lab is so slow today",
+    "can we push the viva practice to thursday?",
+    "i booked the tickets, sending you the screenshot",
+    "thanks for helping me with the assignment yesterday",
+    "is the canteen open on sunday?",
+    "watch this video https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  ],
+  "phishing": [
+    "Your SBI account is blocked. Verify KYC immediately at http://sbi-kyc-update.xyz/login",
+    "URGENT: your PayPal account has been suspended. Confirm your password at paypa1-secure.com/verify",
+    "Congratulations! You won a $1000 gift card. Claim now: bit.ly/3xYzAbC",
+    "Dear customer your parcel is on hold, pay Rs.25 fee at http://192.168.12.4/dhl",
+    "Your Netflix subscription expired. Update payment details: netflix-billing-support.top",
+    "Apple ID locked due to unusual activity. Sign in within 24 hours at appleid-verify-account.com",
+    "HDFC Bank: your card will be deactivated today. Share the OTP sent to you to keep it active",
+    "You have been selected for a refund of Rs 5000. Enter your bank details at http://refund-gov-in.info/claim",
+    "Microsoft security alert: unauthorized login detected. Reset your password now http://login-microsoftonline.support",
+    "Final notice: your Amazon order is on hold. Confirm your account at amaz0n-orders.co/verify"
+  ],
+  "tc04": "Hi, this is HDFC support. Your account will be suspended in 24 hours. Verify your login and password at http://hdfc-secure-verify.xyz/login to avoid blocking."
+}

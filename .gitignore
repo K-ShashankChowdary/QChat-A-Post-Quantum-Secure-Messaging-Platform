@@ -12,3 +12,7 @@ PLAN.md
 
 # Scratch file for composing commit messages
 COMMIT_MSG.txt
+
+# Large on-device AI model files fetched by `npm run fetch-models`
+frontend/public/models/hf/
+frontend/public/models/ort/

@@ -9,12 +9,15 @@ import { encryptForRecipients, decryptEnvelope, b64encode, b64decode, publicKeyF
 import { useTranscriptTree, fetchTranscriptRoot } from '../hooks/useTranscriptTree';
 import { TranscriptBadge, TranscriptPanel, ProofDialog } from './TranscriptPanel';
 import { createMediaCrypto, withEncodedTransforms, mediaTransformSupport } from '../crypto/mediaTransport';
+import {
+  startShield, onShieldStatus, shieldStatus, shieldEnabled, setShieldEnabled, analyzeMessage, describeThreat,
+} from '../ai/threatShield';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Send, Terminal, LogOut, Lock, ShieldCheck,
   Users, Zap, Trash2, Video, PhoneOff, Mic, MicOff, VideoOff, Check, CheckCheck,
   Paperclip, X, Reply, Smile, File, StopCircle, Trash, Download,
-  Copy, UserPlus, Search, Loader2, Menu, KeyRound, ShieldAlert, ArrowDown
+  Copy, UserPlus, Search, Loader2, Menu, KeyRound, ShieldAlert, ArrowDown, Bot, EyeOff, Eye
 } from 'lucide-react';
 
 /* ─── Avatar palette ─── */
@@ -190,6 +193,14 @@ export default function ChatDashboard() {
   const [showConsole, setShowConsole]   = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1024);
   // Below lg the sidebar is a drawer rather than a permanent column.
   const [sidebarOpen, setSidebarOpen]   = useState(false);
+  // AI layer (objective 3): on-device phishing and hate-speech detection.
+  // `threats` holds verdicts for flagged incoming messages, by message id.
+  const [shield, setShield]             = useState(() => shieldStatus());
+  const [shieldOn, setShieldOn]         = useState(() => shieldEnabled());
+  const [threats, setThreats]           = useState({});
+  const [revealed, setRevealed]         = useState({});
+  const scannedRef                      = useRef(new Map());   // id -> { phishing, toxicity } models applied
+
   // Transcript Merkle tree UI: the integrity panel, a peer comparison in
   // flight, and the proof dialog for one message.
   const [showTranscript, setShowTranscript] = useState(false);
@@ -1093,6 +1104,45 @@ export default function ChatDashboard() {
       return { id: String(m.id), label: `${n >= 0 ? `#${n + 1}` : '#?'} · ${who}: ${text.length > 40 ? `${text.slice(0, 40)}…` : text}` };
     }), [messages, transcript.indexOf, peer?.username]);
 
+  /* ─── AI shield ─── */
+  useEffect(() => onShieldStatus(setShield), []);
+  useEffect(() => { if (shieldOn) startShield(); }, [shieldOn]);
+
+  const toggleShield = () => {
+    const next = !shieldOn;
+    setShieldEnabled(next);
+    setShieldOn(next);
+    if (!next) { setThreats({}); scannedRef.current.clear(); }
+  };
+
+  // Scan incoming text messages on this device once they are decrypted. A
+  // message is scanned again when a model that wasn't ready the first time
+  // (the transformer takes a while to download) becomes ready.
+  useEffect(() => {
+    if (!shieldOn) return;
+    const phishingReady = shield.phishing === 'ready';
+    const toxicityReady = shield.toxicity === 'ready';
+    if (!phishingReady && !toxicityReady) return;
+
+    for (const m of messages) {
+      if (m.isMine || m.deleted || m.error || !isRealId(m.id) || (m.type && m.type !== 'text') || !m.text) continue;
+      const done = scannedRef.current.get(m.id);
+      if (done && (done.phishing || !phishingReady) && (done.toxicity || !toxicityReady)) continue;
+      scannedRef.current.set(m.id, { phishing: phishingReady, toxicity: toxicityReady });
+      analyzeMessage(m.text).then((result) => {
+        if (!result) return;
+        const parts = describeThreat(result);
+        if (parts) {
+          setThreats(prev => ({ ...prev, [m.id]: { parts, result } }));
+          addLog(`AI shield flagged a message on-device: ${parts.map(p => p.title).join(' + ')} · ${result.ms} ms`, 'pink');
+        } else {
+          addLog(`AI shield: message clean · phishing ${result.phishing ? result.phishing.score : '—'} · toxicity ${result.toxicity ? result.toxicity.scores.toxic : '—'} · ${result.ms} ms on-device`, 'cyan');
+        }
+      });
+    }
+    if (scannedRef.current.size > 3000) scannedRef.current.clear();
+  }, [messages, shield.phishing, shield.toxicity, shieldOn]);
+
   /** Ask the peer's device for its root over the same messages, and compare. */
   const compareWithPeer = async () => {
     const target = peerRef.current;
@@ -1438,6 +1488,29 @@ export default function ChatDashboard() {
     // sent through and failed the ObjectId cast, silently losing the message.
     const replyToId = isRealId(currentReplyTo?.id) ? currentReplyTo.id : undefined;
 
+    // AI layer, before anything is encrypted (report Fig. 4.1): if the
+    // on-device models flag the draft, stop and ask. The check runs in a
+    // worker on this device, and gives up after 1.5 s rather than hold a
+    // message hostage to a model that is still loading.
+    if (shieldOn && msgType === 'text') {
+      setEncrypting(true);
+      const verdict = await analyzeMessage(textToSend, 1500);
+      setEncrypting(false);
+      const parts = describeThreat(verdict);
+      if (parts) {
+        addLog(`AI shield flagged your draft on-device: ${parts.map(p => p.title).join(' + ')} · ${verdict.ms} ms`, 'pink');
+        const send = await toast.confirm({
+          title: 'The on-device AI flagged this message',
+          body: parts.map(p => (p.detail?.length ? `${p.title}: ${p.detail.join('; ')}.` : `${p.title}.`)).join(' ')
+            + ' Nothing has been sent, and this check never left your device.',
+          confirmLabel: 'Send anyway',
+          cancelLabel: 'Edit message',
+          destructive: true,
+        });
+        if (!send) return;
+      }
+    }
+
     setInput('');
     setAttachment(null);
     setReplyingTo(null);
@@ -1703,6 +1776,42 @@ export default function ChatDashboard() {
       }
     }
 
+    // Incoming message flagged by the on-device AI. Phishing gets a warning
+    // above it; abuse is blurred until the reader chooses to see it.
+    const threat = !msg.isMine && threats[msg.id];
+    if (threat && (!msg.type || msg.type === 'text')) {
+      const abusive = threat.parts.find(p => p.kind === 'toxicity');
+      const phishing = threat.parts.find(p => p.kind === 'phishing');
+      const hidden = abusive && !revealed[msg.id];
+      content = (
+        <div className="flex flex-col gap-1.5">
+          {phishing && (
+            <div className="flex items-start gap-1.5 text-[11px] leading-snug rounded-lg px-2 py-1.5 bg-rose-500/15 border border-rose-400/30 text-rose-200">
+              <ShieldAlert size={12} className="mt-0.5 flex-shrink-0" />
+              <span>
+                <b>Possible phishing</b>
+                {phishing.detail.length > 0 && ` — ${phishing.detail.slice(0, 3).join('; ')}`}. Don't open links or share codes.
+              </span>
+            </div>
+          )}
+          {abusive && (
+            <div className="flex items-center gap-1.5 text-[11px] rounded-lg px-2 py-1.5 bg-amber-400/10 border border-amber-400/30 text-amber-200">
+              <Bot size={12} className="flex-shrink-0" />
+              <span className="flex-1">{abusive.title} by on-device AI</span>
+              <button
+                type="button"
+                onClick={() => setRevealed(prev => ({ ...prev, [msg.id]: !prev[msg.id] }))}
+                className="inline-flex items-center gap-1 font-semibold text-amber-100 hover:text-white"
+              >
+                {hidden ? <><Eye size={11} /> Show</> : <><EyeOff size={11} /> Hide</>}
+              </button>
+            </div>
+          )}
+          <div className={hidden ? 'blur-sm select-none pointer-events-none' : ''} aria-hidden={hidden || undefined}>{content}</div>
+        </div>
+      );
+    }
+
     return (
       <div className="flex flex-col relative z-10">
         {msg.replyToId && (
@@ -1904,6 +2013,30 @@ export default function ChatDashboard() {
               </span>
             </div>
           )}
+        </div>
+
+        {/* AI shield: what the on-device models are doing, and an off switch */}
+        <div className="mx-3 mt-2 px-3 py-2 rounded-xl bg-white/[0.03] border border-white/[0.06] flex items-center gap-2.5">
+          <Bot size={14} className={shieldOn ? 'text-violet-300' : 'text-slate-600'} />
+          <div className="flex-1 min-w-0">
+            <p className="text-[10px] font-semibold text-slate-300">On-device AI shield</p>
+            <p className="text-[9px] text-slate-500 truncate" title={shield.error || ''}>
+              {!shieldOn ? 'Off — messages are not scanned'
+                : `Phishing ${shield.phishing === 'ready' ? '✓' : shield.phishing === 'error' ? '✗' : '…'} · `
+                  + `Hate speech ${shield.toxicity === 'ready' ? '✓' : shield.toxicity === 'error' ? '✗'
+                    : shield.progress ? `${shield.progress}%` : '…'}`}
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={shieldOn}
+            aria-label="On-device AI shield"
+            onClick={toggleShield}
+            className={`relative w-8 h-[18px] rounded-full transition-colors flex-shrink-0 ${shieldOn ? 'bg-violet-500/80' : 'bg-white/10'}`}
+          >
+            <span className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white transition-all ${shieldOn ? 'left-[16px]' : 'left-[2px]'}`} />
+          </button>
         </div>
 
         <div className="px-5 pt-3 pb-2 flex items-center justify-between">
