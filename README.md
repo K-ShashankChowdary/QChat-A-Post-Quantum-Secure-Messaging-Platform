@@ -36,14 +36,15 @@ The five objectives from Chapter 1.2 of the report, mapped to the delivered syst
 | # | Objective | Status |
 |---|---|---|
 | 1 | Hybrid encryption framework combining **ML-KEM** with **AES-256** for secure key exchange and message confidentiality | ✅ **Delivered.** ML-KEM-768 encapsulation per recipient, AES-256-GCM over the content, HKDF-SHA256 key derivation. Payload v2 encrypts once and wraps the content key per party — a measured **49.9%** reduction in stored bytes over the naive approach. |
-| 2 | Data integrity through a **Merkle hash chain**, detecting unauthorized modification of chat history | ✅ **Delivered.** Every message is hashed and cryptographically linked to its predecessor, folding in text, timestamp and direction. Altering any stored message breaks the chain from that point forward and the digest shown in the chat header stops matching. Extending the chain into a branching tree with per-message inclusion proofs is scoped as `FEAT-3`. |
+| 2 | Data integrity through a **Merkle hash chain**, detecting unauthorized modification of chat history | 🟡 **Delivered as a chain; the tree is next.** Every message is linked to its predecessor by SHA-256 over values both participants hold identically — sender id, server id, server timestamp and text — so both devices compute the **same** digest, shown in the chat header. If the server drops, reorders or swaps a message on one side, the two digests disagree. The branching Merkle tree with per-message inclusion proofs is `FEAT-3`. |
 | 3 | On-device **AI phishing detection**, preserving privacy by keeping analysis local | 🔜 **Phase II.** The architecture reserves the AI Layer and the client-side inference boundary it requires; the model itself is future scope, consistent with report §5.2. |
 | 4 | Secure real-time **WebRTC** video calling with post-quantum protection of **signaling and media** | ✅ **Delivered, and extended.** Signaling is ML-KEM sealed, and *every encoded media frame* is additionally sealed with AES-256-GCM under an ML-KEM-derived key — so the audio and video are protected by post-quantum cryptography, not only by WebRTC's classical DTLS-SRTP. Verified in live two-party calls. |
 | 5 | **Scalable and modular architecture** supporting future enhancement | ✅ **Delivered.** Clean layer and module separation (§8), env-driven configuration, stateless JWT auth, room-based socket fan-out and cursor-paged history — all of which scale horizontally. Formal load characterisation is scheduled as `OPS-1`. |
 
-**Four of five objectives are implemented and working**, including the full
-post-quantum media path that the report lists only as a target. The fifth is deliberately
-sequenced into Phase II.
+**Three of five objectives are fully delivered**, including the full post-quantum media
+path that the report lists only as a target. Integrity is delivered as a hash chain, with
+the tree as the next step, and on-device AI detection is deliberately sequenced into
+Phase II.
 
 ---
 
@@ -132,8 +133,13 @@ await axios.post('/api/auth/register', { username, password, publicKey: b64Pub }
     and additionally stored server-side **encrypted under the account password** so it can
     be recovered on another device (Section 3.1). The plaintext key never leaves the browser.
 
-### 2.3 Code Implementation: Encrypting the Transmission
+### 2.3 Code Implementation: Encrypting the Transmission (v1, historical)
 *File: `frontend/src/crypto/encryption.js`*
+
+> This is the **original v1** writer, kept here because it is the simplest
+> illustration of KEM + DEM. Nothing sends v1 any more, so `encryptMessage` has
+> been removed from the code; current messages use the v2 envelope in §2.5.
+> `decryptMessage` (§2.4) is still in the code so stored v1 history keeps opening.
 
 When Alice sends "Hello" to Bob, Bob's 1184-byte Public Key is fetched to encapsulate a secret. Because KEM systems encrypt data incredibly slowly, QChat implements a Key Derivation Function (KDF) into a fast, symmetric AES-256 cipher.
 
@@ -179,7 +185,9 @@ export async function encryptMessage(text, recipientPublicKey) {
   }
 }
 ```
-`text` is not limited to chat text — attachments (base64-encoded images/audio/files) and WebRTC signaling payloads (`JSON.stringify`'d SDP/ICE data) are passed through this exact same function. See Section 5 and 6 below.
+In the current code the same role is played by `encryptForRecipients` (§2.5), and `text`
+is not limited to chat text: attachments (base64 images, audio and files), reactions and
+WebRTC signaling (`JSON.stringify`'d SDP/ICE data) all go through it. See Sections 5 and 6.
 
 The 16-byte `authTag` is a MAC (Message Authentication Code). If the server tries to flip a single bit of the ciphertext stream, the Native Web Crypto subsystem instantly invalidates decoding to prevent tamper attacks.
 
@@ -348,59 +356,69 @@ To prevent the Zero-Knowledge backend from arbitrarily destroying chat sequences
 
 $$H_0 = 0^{256}$$
 
-$$H_n = \mathrm{SHA\text{-}256}\!\left(H_{n-1} \,\|\, \mathrm{Text}_n \,\|\, \mathrm{Timestamp}_n \,\|\, \mathrm{Dir}_n\right), \qquad \mathrm{Dir}_n \in \{\texttt{in},\ \texttt{out}\}$$
+$$H_n = \mathrm{SHA\text{-}256}\!\left(H_{n-1} \,\|\, \mathrm{enc}\left(\mathrm{sender}_n,\ \mathrm{id}_n,\ t_n,\ \mathrm{text}_n\right)\right)$$
 
-where $\|$ is byte concatenation and $H_0$ is 256 zero bits. Folding
-$\mathrm{Dir}_n$ into the hash is what stops a message being silently reattributed
-to the other party: the text and timestamp would be unchanged, but the chain
-would not be.
+where $\|$ is byte concatenation, $H_0$ is 256 zero bits, and $\mathrm{enc}$ is a JSON
+array — unambiguous where bare concatenation is not (`"ab"+"c"` and `"a"+"bc"` would
+otherwise hash alike). Messages are put in canonical $(t_n, \mathrm{id}_n)$ order first,
+so arrival order on either device cannot change the result.
+
+Every input is a value **both participants hold identically**: the sender's *user id*
+rather than a viewer-relative "in/out", and the *server's* message id and timestamp rather
+than a local clock. That is the whole point — the two devices compute the same digest, so
+comparing them is a real check. (An earlier version hashed `out` on the sender's device and
+`in` on the recipient's, which meant the two digests could never agree.) Only messages the
+server has acknowledged, that are not deleted, and that decrypted are chained.
 
 #### Execution Snippet
 ```javascript
-export async function calculateIntegrity(messages) {
-  if (!messages || messages.length === 0) return '0x0000...';
+export async function calculateIntegrity(entries) {   // [{ from, id, timestamp, text }]
+  if (!Array.isArray(entries) || entries.length === 0) return null;
 
-  let currentHash = new Uint8Array(32); // Seed
+  const ordered = entries
+    .map(e => ({ ...e, time: new Date(e.timestamp).toISOString() }))
+    .sort((a, b) => (a.time === b.time
+      ? (String(a.id) < String(b.id) ? -1 : 1)
+      : (a.time < b.time ? -1 : 1)));
 
-  for (const msg of messages) {
-    // Direction (in/out) is folded into the hash so a message can't be
-    // silently reattributed to the other party without changing the chain.
-    const direction = msg.isMine ? 'out' : 'in';
-    const data = new TextEncoder().encode(msg.text + msg.timestamp + direction);
-
-    // Concat previous hash recursively to the current payload data
-    const combined = new Uint8Array(currentHash.length + data.length);
-    combined.set(currentHash);
-    combined.set(data, currentHash.length);
-
-    // Hash the recursive array outputting a cascading checksum
-    const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
-    currentHash = new Uint8Array(hashBuffer);
+  const encoder = new TextEncoder();
+  let current = new Uint8Array(32);                    // H_0
+  for (const e of ordered) {
+    const record = encoder.encode(JSON.stringify([String(e.from), String(e.id), e.time, String(e.text ?? '')]));
+    const combined = new Uint8Array(current.length + record.length);
+    combined.set(current);
+    combined.set(record, current.length);
+    current = new Uint8Array(await crypto.subtle.digest('SHA-256', combined));   // H_n
   }
-
-  return b64encode(currentHash).slice(0, 16) + '...';
+  return [...current].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 ```
-> **Note:** this is a linear hash chain (each message folds into one running hash), not yet a branching Merkle tree with independently-verifiable left/right subtrees as described conceptually above. Tracked in `improve.txt` → `FEAT-3`.
-If anyone with database access alters the text or timestamp of message 5, every hash from
-that point forward differs, and the digest shown in the chat header no longer matches what
-either client computes. Detection is the guarantee; the chain says *that* history changed,
-not *which* message changed — locating it means replaying the chain. A Merkle tree would
-give per-message inclusion proofs instead, which is the upgrade tracked as `FEAT-3`.
+
+**What it detects.** Editing a stored message's ciphertext is already caught by AES-GCM —
+it simply fails to open. The chain adds what GCM cannot see: a server that **drops,
+reorders or substitutes** messages in one party's view. Compare the header digest on both
+devices; with the same messages loaded they are identical, and any difference means the
+two transcripts are not the same.
+
+> **Note:** this is a linear hash chain, not yet a branching Merkle tree. The chain says
+> *that* history differs, not *which* message — locating it means replaying the chain. A
+> Merkle tree would give per-message inclusion proofs; that upgrade is `FEAT-3`. The digest
+> also covers the messages currently loaded, so compare with the same history paged in.
 
 
 ## 5. Secure Real-Time Communication (WebRTC Video Calling)
 *File: `frontend/src/components/ChatDashboard.jsx`*
 
-QChat extends its hybrid encryption model to peer-to-peer video calling. WebRTC handles the actual audio/video transport, but every piece of *signaling* — SDP offers, answers, and ICE candidates — is individually wrapped through the same `encryptMessage`/`decryptMessage` pipeline used for chat messages before it ever touches the Socket.io relay:
+QChat extends its hybrid encryption model to peer-to-peer video calling. WebRTC handles the actual audio/video transport, but every piece of *signaling* — SDP offers, answers, and ICE candidates — is individually wrapped through the same `encryptForRecipients`/`decryptEnvelope` pipeline used for chat messages before it ever touches the Socket.io relay:
 
 ```javascript
-const encryptAndSendSignal = async (signalData, toId) => {
-  if (!peerRef.current?.public_key) return;
+// `target` is the person the call is pinned to (see "Call control" below)
+const encryptAndSendSignal = async (signalData, target = callPeerRef.current) => {
+  if (!target?.public_key) return;
   const payload = await encryptForRecipients(JSON.stringify(signalData), [
-    { id: String(peerRef.current.id), publicKey: b64decode(peerRef.current.public_key) },
+    { id: String(target.id), publicKey: b64decode(target.public_key) },
   ]);
-  socketRef.current?.emit('webrtc_signal', { toId, signalPayload: payload });
+  socketRef.current?.emit('webrtc_signal', { toId: target.id, signalPayload: payload });
 };
 ```
 Note there is no `fromId` in that emit. The server derives the sender from the
@@ -409,16 +427,32 @@ authenticated socket (Section 7.1), so a client cannot claim to be someone else.
 The signaling server (`backend/server.js`) only ever relays an opaque encrypted blob between two socket IDs — it never sees an SDP offer, an ICE candidate, or the resulting media stream in plaintext:
 
 ```javascript
-socket.on('webrtc_signal', ({ toId, signalPayload }) => {
-  if (!isValidObjectId(toId)) return;
+socket.on('webrtc_signal', async ({ toId, signalPayload } = {}) => {
+  if (!(await canReach(toId))) return;   // only between accounts that know each other
   io.to(String(toId)).emit('webrtc_signal', { fromId: userId, signalPayload });
 });
 ```
+`canReach` admits a signal only when the two accounts already have a contact link (either
+direction) or message history, so an arbitrary user id cannot be rung or spammed. Typing
+indicators use the same check.
 Delivery is by **room**, not by a socket-id lookup table: every socket joins a room
 named after its user id, so a user with several tabs open receives the signal on all
 of them and the server keeps no connection map to fall out of sync.
 
-Once both sides exchange an encrypted offer/answer and ICE candidates, `RTCPeerConnection` establishes a direct peer-to-peer media path. Call state (`idle → calling/receiving → connected`) is tracked client-side; hanging up sends an encrypted `end_call` signal so both peers tear down cleanly.
+Once both sides exchange an encrypted offer/answer and ICE candidates, `RTCPeerConnection` establishes a direct peer-to-peer media path. Call state (`idle → calling/receiving → connected`) is tracked client-side.
+
+#### Call control
+- **Pinned to one person.** When a call starts, its peer is pinned. Signals go only to
+  them, and an answer, ICE candidate or hang-up from anyone else is ignored — public keys
+  are public, so anyone *can* encrypt a signal to you, and earlier the client accepted it.
+  Switching chats is blocked until the call ends.
+- **Incoming calls ring anywhere.** An offer opens the caller's conversation instead of
+  being dropped as a "missed call" when a different chat was open.
+- **Decline, busy, no answer.** Declining sends an encrypted `decline`, so the caller stops
+  ringing. An offer that arrives mid-call is answered `busy`. An unanswered call gives up
+  after 45 seconds. If both sides ring each other at once, the lower user id keeps its call.
+- **Hang-up** sends an encrypted `end_call`; both peers release the camera and zero the
+  media key.
 
 #### ICE and TURN
 STUN only tells a peer its own public address; it cannot relay traffic. Two peers
@@ -478,12 +512,17 @@ hardware encoding, so the codec is forced rather than assumed.
 **Browser support.** Chrome and Edge use `createEncodedStreams` on the main thread;
 Firefox and Safari use `RTCRtpScriptTransform`, which delivers frames only to a worker.
 A browser offering neither falls back to plain DTLS-SRTP **and says so** — in the
-protocol console and as an amber badge on the call. The badge turns green only once a
+protocol console and as an amber badge on the call. The fallback is **negotiated**: a
+caller that cannot seal frames sends no media key, and a callee that cannot answers with
+`mediaSealed: false`, at which point the caller switches its transforms to pass-through.
+Without that, one side sent ciphertext the other could not open and the call froze. The badge turns green only once a
 frame has actually been *opened* on the receive side, because the presence of an API
 proves nothing about whether the peer can read what was sent.
 
-> **Scope note:** this path is verified Chrome-to-Chrome. The Firefox/Safari worker
-> path is implemented but has not been exercised.
+> **Scope note:** sealed media is verified Chrome-to-Chrome, and the negotiated fallback
+> is verified against a Chrome callee with the encoded-frame APIs removed (video flows
+> both ways, both badges amber). The Firefox/Safari worker path is implemented but has
+> not been exercised on those browsers.
 
 ## 6. Messaging Features (Attachments, Replies, Reactions, Delete, Presence)
 
@@ -492,19 +531,25 @@ Beyond text, QChat's chat surface supports the messaging primitives users expect
 - **Attachments** — images, voice notes, and files are read client-side as base64 (`FileReader`/`MediaRecorder`), then encrypted exactly like a text message, through the same v2 envelope (`encryptForRecipients`). They travel in a versioned JSON wrapper carrying filename and mime type so both survive the encryption round trip. A size ceiling is enforced **server-side** as well as in the client, and the Socket.io transport buffer is raised to match.
 - **Reply threading** — replies carry a `reply_to_id` pointing at the original message; the UI renders an inline quote and scrolls to the original on click.
 - **Emoji reactions** — reactions are pushed to the `Message.reactions` array and synced live over `message_reaction` socket events to both sender and recipient.
-- **Delete for everyone** — deleting a message is a soft delete: the server clears `payload`/`sender_payload` and sets `deleted: true`; clients render a tombstone rather than removing the message outright.
-- **Presence** — `User.is_online` and `User.last_seen` are updated on socket connect/disconnect and broadcast via `user_status`, driving the online dot and "Last seen …" text in the UI.
+- **Delete for everyone** — deleting a message is a soft delete: the server clears `payload`/`sender_payload` and its reactions and sets `deleted: true`; clients render a tombstone rather than removing the message outright.
+- **Presence** — `User.is_online` and `User.last_seen` are updated on socket connect/disconnect and sent via `user_status` **only to related accounts** (contacts in either direction, and anyone with shared history). It used to be broadcast to every connected socket.
+- **Unread counts** — `GET /api/users` returns an unread count per contact, and a message for a chat that isn't open increments it live. A first message from someone new refreshes the list so they appear immediately.
+- **Attachment safety** — an attachment's URL is chosen by the sender, so it is rendered only if it is a base64 `data:` URL of the expected kind. A `javascript:` URL in a file link would otherwise run in the recipient's page — React 18 renders such URLs and Chromium executes them even on a link with a `download` attribute — and that page holds the private key.
 
 Reactions are end-to-end encrypted. Each user's entire emoji set is stored as one
 row, encrypted to both participants, so the server performs a blind upsert or
-delete keyed on user id and never learns which emoji was used. That means the
+delete keyed on user id and never learns which emoji was used. The upsert is two
+atomic updates (`$pull`, then a guarded `$push`) rather than load-modify-save, which
+used to drop one reaction when both people reacted at the same moment. That means the
 toggle is computed client-side — the server cannot compare an emoji it can't
 read. Pre-v2 plaintext reactions still render.
 
 History is paged at 50 messages. Scrolling to the top loads the previous page
-using a **timestamp cursor** rather than an offset — an offset shifts when live
-messages arrive mid-scroll, which silently skips a page — and the scroll position
-is preserved across the prepend.
+using a **(timestamp, id) cursor** rather than an offset — the id breaks ties between
+messages stored in the same millisecond, which a bare timestamp cursor skipped. An offset shifts when live
+messages arrive mid-scroll, which silently skips a page. The scroll position is
+preserved across the prepend, and a page that comes back after you have switched
+chats is discarded rather than landing in the wrong conversation.
 
 > **Known limitation:** attachments are base64-encoded and stored inline in the
 > message document rather than in dedicated blob storage. Since payload v2 the body
@@ -615,16 +660,21 @@ Stating this plainly matters more than any feature list.
 | **The server operator reading messages** | The server stores ciphertext and wrapped keys only. It never holds a content key. |
 | **The server operator reading reactions** | Reaction emoji sets are encrypted to both parties; the server upserts blindly by user id. |
 | **A stolen database** | Private-key backups are AES-256-GCM sealed under PBKDF2-SHA256 (600,000 iterations) of the user's password. |
-| **Tampering with a stored message** | AES-GCM authentication tags fail on any modification; the integrity chain changes if history is reordered or altered. |
-| **Impersonation over the socket** | The actor is derived from the handshake-verified JWT, never from the event body. |
-| **Account enumeration** | Contact lookup is exact-match on a random ~1.1e12-space id, separately rate-limited. |
+| **Tampering with a stored message** | AES-GCM authentication tags fail on any modification. Dropping or reordering messages in one party's view makes the two devices' integrity digests disagree. |
+| **Another user impersonating you over the socket** | The actor is derived from the handshake-verified JWT, never from the event body. |
+| **Another user interfering with a call** | Signals are accepted only from the pinned call peer, and the relay only forwards signals between related accounts. |
+| **Script injection via attachments** | Attachment URLs are rendered only as base64 `data:` URLs of the expected type; `javascript:` and anything else is shown as blocked. |
+| **Account enumeration** | Contact lookup is exact-match on a random ~1.1e12-space id, separately rate-limited. Sign-in gives one answer for an unknown username and a wrong password, at equal bcrypt cost. |
+| **Password guessing** | Per-IP rate limit on auth, plus a per-account lock after 5 failures in 15 minutes. |
+| **Presence snooping** | Online/last-seen updates go only to related accounts. |
 
 ### Explicitly NOT protected against
 
 | Threat | Why |
 |---|---|
-| **A malicious server** | The server receives the password at sign-in to verify it against the bcrypt hash, so a hostile server could capture it and unwrap a key backup. Defends against a stolen database, not an actively malicious operator. Deriving a separate client-side auth value would close this. |
-| **XSS or a compromised browser** | The private key lives in `localStorage` and is readable by any injected script. This is an architectural tradeoff of browser-based E2EE. |
+| **A malicious server — password capture** | The server receives the password at sign-in to verify it against the bcrypt hash, so a hostile server could capture it and unwrap a key backup. Defends against a stolen database, not an actively malicious operator. Deriving a separate client-side auth value would close this. |
+| **A malicious server — forged senders** | ML-KEM gives confidentiality, not sender authentication. Public keys are public, so the server can encrypt a message (or a call offer) to you and label it as coming from any contact. Signing every payload with **ML-DSA** (FIPS 204, also in `@noble/post-quantum`) would close this; it is not implemented. |
+| **XSS or a compromised browser** | The private key lives in `localStorage` and is readable by any injected script. Known injection paths are closed (attachment URLs above), but this remains an architectural tradeoff of browser-based E2EE. |
 | **Metadata analysis** | The server necessarily knows who talks to whom, when, message sizes and timing. Content is blind; the social graph is not. |
 | **Phishing and social engineering** | Objective 3 was to address this on-device. It is not implemented. |
 | **A malicious peer** | Anyone you talk to can screenshot, copy or retain plaintext. E2EE protects transport and storage, not the endpoint. |
@@ -704,9 +754,15 @@ next phase has a concrete starting point.
 | Repository contents: "System architecture diagrams, flowcharts, and supporting images" (Appendix C) | Figures 3.1 and 4.1 exist in the report but are not in the repository. | — |
 | Appendix C repository link | Points at `Project-Title-Q-Chat-…`. The repo has since been renamed to `QChat-A-Post-Quantum-Secure-Messaging-Platform`; GitHub redirects, so the printed link still resolves. | — |
 | Slide deck tech stack names **Redis** and **Docker** | Neither is a dependency of this project. | — |
+| Sender authenticity (implied by "secure messaging") | Content is confidential, but nothing proves who sent it against a hostile server. ML-DSA signatures are the planned fix. | — |
 
 **Verified working:** post-quantum call media has been confirmed in a live two-party
-call on Chrome. The Firefox/Safari code path is implemented but has not been exercised.
+call on Chrome, and the whole stack has been driven end-to-end in two headless Chromium
+sessions against a real MongoDB: registration and key recovery on a new device, matching
+integrity digests, the attachment-URL guard, presence and relay scoping, decline /
+spoofed hang-up / chat-lock during calls, sealed and negotiated-fallback media, concurrent
+reactions, tie-safe paging, uniform login errors and logout cleanup. The Firefox/Safari
+code path is implemented but has not been exercised.
 
 Cryptographic correctness has been verified by direct exercise of the primitives —
 round-trip encryption in both directions, rejection of tampered ciphertext and headers,

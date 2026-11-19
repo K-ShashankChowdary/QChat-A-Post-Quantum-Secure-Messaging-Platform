@@ -41,6 +41,7 @@ README's phrasing imply otherwise.
 | `utils/qchatId.js` (46) | `QC-XXXX-XXXX` generate / normalise / allocate. |
 | `utils/validation.js` (66) | Username, password, public key, key-backup shape. |
 | `utils/logger.js` (48) | Structured console logger with contexts. |
+| `utils/serialize.js` | `serializeMessage` — the one wire shape for a message (relay, offline delivery, history). |
 | `scripts/delete-user.js` (49) | Deletes an account + its messages + contact refs. |
 
 ### Frontend (`frontend/src/`, ~2,100 lines)
@@ -50,7 +51,7 @@ README's phrasing imply otherwise.
 | `components/Landing.jsx` (399) | Explainer page: threat model, pipeline, spec table, server-knowledge split. |
 | `components/Login.jsx` (178) | **Key recovery lives here** — three branches (§5). |
 | `components/Register.jsx` (178) | Keygen + wrap + register. |
-| `crypto/encryption.js` (407) | v1, v2, key backup, key identity, integrity chain, b64 helpers. |
+| `crypto/encryption.js` | v2 write + v1/v2 read, key backup, key identity, integrity chain, b64 helpers. (The v1 *writer* `encryptMessage` was removed; nothing sends v1.) |
 | `crypto/mediaCrypto.js` (160) | Per-frame cipher for call media. |
 | `crypto/mediaTransport.js` (83) | Wires the frame cipher into an `RTCPeerConnection`. |
 | `crypto/mediaTransform.worker.js` (31) | Firefox/Safari path. **Never actually executed.** |
@@ -142,10 +143,21 @@ downstream depends on turning a 32-byte KEM output into a proper key.
 ### Integrity chain (`calculateIntegrity`)
 ```
 H_0 = 32 zero bytes
-H_n = SHA-256( H_{n-1} ‖ text_n ‖ timestamp_n ‖ direction_n )
+H_n = SHA-256( H_{n-1} ‖ JSON([sender_user_id, server_id, iso_timestamp, text]) )
 ```
-`direction` is `'out'`/`'in'`, folded in so a message cannot be silently reattributed to the
-other party. Displayed as the first 16 base64 chars in the chat header.
+Input is `[{ from, id, timestamp, text }]`, sorted into canonical (time, id) order inside the
+function. Returns full hex; the header shows 8 chars, the tooltip 32.
+
+**Every field is one both participants hold identically**, so both devices compute the same
+digest and comparing them is a real check. The first version hashed `'out'` on the sender's
+side and `'in'` on the recipient's (and mixed a local `Date.toString()` with server ISO
+strings), so the two digests could never match — while the tooltip claimed they should.
+Only acknowledged (`isRealId`), non-deleted, decrypted messages are chained. JSON encoding,
+not concatenation, so `"ab"+"c"` and `"a"+"bc"` don't collide.
+
+What it adds over GCM: GCM already rejects an edited ciphertext. The chain catches a server
+that **drops, reorders or substitutes** messages in one party's view. It does *not* catch a
+server forging a message into both views — see the ML-DSA gap in §7.
 
 **This is a hash chain, not a Merkle tree.** It detects that *something* changed; it cannot
 prove *which* message is intact without replaying the whole chain, and it has no branching
@@ -199,6 +211,12 @@ compare an emoji it cannot read. So the toggle is computed client-side and the c
 set is sent. The server broadcasts the authoritative array and clients **replace** rather
 than append — that is what stops your own reaction counting twice (optimistic + echo).
 
+The upsert is two atomic updates — `$pull` the user's row, then `$push` guarded by
+`'reactions.user_id': { $ne: userId }` — not load-modify-save. `msg.save()` after a `splice`
+rewrites the whole array under a version check, so two people reacting at once made the
+second save throw `VersionError` and that reaction vanished. Deleted messages can't be
+reacted to, and deleting clears `reactions`.
+
 Pre-v2 plaintext reactions (`emoji` field) still render.
 
 ---
@@ -212,6 +230,21 @@ Pre-v2 plaintext reactions (`emoji` field) still render.
 - **Presence via rooms.** Each socket joins a room named after its user id. Several tabs are
   one online user; `isUserOnline` reads the room size. On `disconnect`, rooms are already
   left, so the check reflects the user's *other* tabs.
+- **Handlers before setup.** `io.on('connection')` registers every `socket.on` *first* and
+  runs the awaited setup (mark online, presence, offline queue) *last*. The other way round,
+  anything a client emitted right after connecting arrived while no handler existed and was
+  silently dropped. Setup also bails if the socket already disconnected.
+- **Presence is scoped.** `broadcastPresence` sends `user_status` only to `presenceAudience`:
+  my contacts, anyone with me as a contact, and anyone I share history with. It used to be
+  `io.emit` — every account on the server learned who was online.
+- **Relay is scoped.** `webrtc_signal`, `typing` and `stop_typing` pass only if `canReach`:
+  a contact link either direction or shared history (`areConnected`), positive results cached
+  per socket. `send_message` is *not* gated (a first message is a feature) but rejects self
+  and nonexistent recipients.
+- **Login.** One error for unknown user and wrong password, with a dummy bcrypt compare so
+  timing matches; per-username lock after 5 failures / 15 min (in-memory map) on top of the
+  per-IP limiter.
+- **`GET /api/health`** → `{ ok, db }`. SIGINT/SIGTERM close sockets and Mongo cleanly.
 - **Offline queue.** `deliverPendingMessages` flushes `delivered: false` messages on connect,
   then notifies each original sender via `message_delivered`.
 - **`maxHttpBufferSize` = 12MB.** Socket.io's 1MB default silently killed the connection on
@@ -226,12 +259,19 @@ Pre-v2 plaintext reactions (`emoji` field) still render.
 - **Contact list** = explicit contacts ∪ anyone messaged − `hidden_contacts`. A removal
   records a timestamp; the person reappears only if they send something **newer** than it.
   Without this, removing someone you had history with silently un-removed them on reload.
-- **History paging.** Timestamp cursor (`before=`), 50/page, max 100. Offset paging is kept
+- **History paging.** `(timestamp, _id)` cursor (`before=` + `beforeId=`), sorted
+  `{timestamp:-1, _id:-1}`, 50/page, max 100. A bare timestamp cursor skipped messages that
+  shared a millisecond across a page boundary. Offset paging is kept
   only as a fallback because it skews when live messages arrive mid-scroll and skips a page.
   The client holds scroll position across the prepend by shifting `scrollTop` by exactly the
   height the prepended block added.
-- **Deletes are soft.** Server clears `payload`/`sender_payload`, sets `deleted: true`.
+- **Deletes are soft.** Server clears `payload`/`sender_payload`/`reactions`, sets `deleted: true`.
   Ownership is enforced *in the query* (`{ _id, from_user_id: userId }`), not after the fetch.
+- **Unread counts.** `GET /api/users` aggregates unread, non-deleted messages per sender and
+  returns `unread` on each contact.
+- **Not protected: forged senders.** ML-KEM is confidentiality only. Public keys are public,
+  so a hostile *server* can encrypt a message or call offer to you and label it from anyone.
+  ML-DSA (FIPS 204, in `@noble/post-quantum`) signatures are the fix; not implemented.
 - **Boot guard.** `config/env.js` refuses to start on a missing, placeholder or <32-char
   `JWT_SECRET`. Note `backend/.env.example` ships `change-me-to-a-long-random-secret`, which
   is itself on the rejected list — copying the example verbatim fails loudly by design.
@@ -280,6 +320,25 @@ moves — one more failure mode, no upside. That flag also gates
 later. No API at all → the call proceeds on DTLS-SRTP and **says so**, in the log and as an
 amber badge.
 
+**Negotiated fallback.** The caller mints a media key only if `mediaTransformSupport() !==
+'none'`, and the `RTCPeerConnection` gets `encodedInsertableStreams` only when a key exists —
+with that flag set, Chrome moves *no* media unless every track is piped through a transform.
+The callee answers with `mediaSealed` (= its sender transform attached); `false` makes the
+caller call `media.disable()`, flipping a shared `control.sealed` flag so its transforms pass
+frames through (the worker gets a `passthrough` message). Before this, mixed support meant
+one side sent ciphertext the other couldn't open. The worker now also posts
+`media-crypto-first`; it didn't, so the badge sat on "Negotiating…" forever off Chrome.
+
+**Call control.** `callPeerRef` pins who the call is with (set by `startCall` or an incoming
+offer). `encryptAndSendSignal(signal, target = callPeerRef.current)`; every non-offer signal
+from anyone else is ignored — earlier, any account could send you an `end_call` or `answer`,
+and signals followed whatever chat was open. `selectPeer` refuses to switch chats mid-call
+(`{ force: true }` bypasses it for an incoming call). Signals: `offer` · `answer`
+(`mediaSealed`) · `candidate` · `end_call` · `decline` · `busy`. An incoming offer opens the
+caller's chat; an offer while busy gets `busy`; glare → lower user id keeps its call; caller
+gives up after 45 s. `callStatusRef` + `updateCallStatus` keep status readable from the
+once-bound socket handlers.
+
 The in-call badge turns green only once a frame has been **opened on the receive side**.
 API presence proves nothing about whether the peer can read what was sent — an earlier
 version went green on presence alone and lied for two whole test calls.
@@ -305,6 +364,20 @@ version went green on presence alone and lied for two whole test calls.
   when it is one fact stated once.
 - `keyStatus` compares this device's derived fingerprint against the server's and reports
   `ok` / `mismatch` / `missing` / `invalid`.
+- **`safeDataUrl(data, kind)`** gates every attachment `src`/`href`: base64 `data:` URLs of
+  the expected type only. A sender-chosen `javascript:` URL in the file link used to run in the
+  recipient's page (React 18 renders it; Chromium runs it even with `download`) — with the
+  private key and JWT sitting in `localStorage`. Verified exploitable before the fix.
+- **Stale responses.** `loadHistory` / `loadOlderMessages` drop a page if `peerRef` moved on
+  while it was in flight, and `loadHistory` merges with live arrivals instead of replacing.
+  `sendMessage` pins its target before the encryption await and restores the draft on failure.
+- **Unread + first contact.** `noteBackgroundMessage` bumps `u.unread`, or calls `fetchUsers()`
+  if the sender isn't in the list yet. `fetchUsers` writes `usersRef` synchronously so an
+  awaiting caller (`findContact`) sees the fresh list.
+- `logout` hangs up, closes the socket and calls `clearSession()` (which also clears the
+  remembered chat). A failed sign-in also `clearSession()`s — the token used to survive a
+  failed key recovery. Login derives the public key from the stored private key (FIPS 203
+  offsets) instead of trusting the stored copy.
 - Toast system replaces all `alert()`/`confirm()`. `toast.confirm` is promise-based; Escape
   cancels, Enter confirms.
 
@@ -331,6 +404,19 @@ What changed, so you know what to expect if you remember the old text:
 - **`PLAN.md`** — carries a SUPERSEDED banner. It is a pre-Phase-II snapshot; plan from
   `CLAUDE.md` and `improve.txt` instead.
 
+**Nov 2026 hardening pass** (bugs found in a full audit, all fixed): attachment-URL XSS,
+viewer-relative integrity chain, unpinned call signals, silent decline, stale history
+responses, invisible first messages / no unread counts, global presence broadcast, half
+sign-in after a failed recovery, broken mixed-support media, reaction race, timestamp-tie
+paging, login enumeration, handlers registered after setup, stale `frontend/dist` tracked in
+git. README §1, §2.3, §4, §5, §5.1, §6, §9 and §11 were updated to match, including the
+forged-sender gap in the threat model.
+
+Verification for that pass was a 21-check end-to-end run (two headless Chromium sessions
+with fake camera/mic, real MongoDB via `mongodb-memory-server`, plus a hand-rolled
+socket.io "attacker" client). Like the media-cipher tests, it was run ad hoc and is **not
+committed** — don't cite it as repo-verifiable.
+
 **Still worth knowing:** the slide deck (`Major_Project_Presentation.pptx`) names **Redis and
 Docker** in its tech stack; neither appears in any dependency list. The README never did, so
 this is a slides-only correction. There are also **no tests committed** anywhere in the repo —
@@ -356,6 +442,10 @@ the 13 media-cipher tests were run ad hoc, so do not cite them as repo-verifiabl
   vanished behind the backdrop until it got `relative z-10`.
 - **Canvas backing stores do not follow layout.** `LatticeField` needed a `ResizeObserver`;
   a window-resize listener only suffices for a viewport-sized element.
+- **`await` before `socket.on` drops events.** Anything a client emits while the
+  connection handler is still awaiting setup has no listener yet. Register handlers first.
+- **The device's `node_modules` are macOS builds.** `npx vite build` can't run in the Linux
+  shell on the device (darwin esbuild/bcrypt); build and test in the cloud workspace.
 - **esbuild parses JSX that renders wrong.** It will not catch a destroyed `return`, a
   self-referencing variable, or mismatched nesting. Check div balance separately.
 
@@ -371,6 +461,8 @@ the 13 media-cipher tests were run ad hoc, so do not cite them as repo-verifiabl
   reference + key material in the payload would roughly halve storage and bandwidth.
 - **FEAT-2** — on-device AI phishing detection. Objective 3. No code exists.
 - **FEAT-3** — true branching Merkle tree. Objective 2. The hash chain is the foundation.
+- **(unticketed)** ML-DSA signatures on every payload — closes the forged-sender gap.
+- **(unticketed)** commit the e2e suite as a real regression test.
 
 ---
 
