@@ -11,6 +11,42 @@ const CTX = 'Messages';
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 50;
 
+/* ── GET /api/messages/:peerId/leaves ──
+   Every Merkle leaf in the conversation, oldest first — 32 bytes a message,
+   so a client can rebuild the root over the whole history, not just the page
+   it has loaded. Order is (timestamp, _id), the same canonical order the
+   client sorts into. */
+const MAX_LEAVES = 50_000;
+
+router.get('/:peerId/leaves', authenticateToken, async (req, res) => {
+  const currentUserId = req.user.id;
+  const { peerId } = req.params;
+  if (!isValidObjectId(peerId)) return res.status(400).json({ error: 'Invalid peer id' });
+
+  try {
+    const rows = await Message.find({
+      $or: [
+        { from_user_id: currentUserId, to_user_id: peerId },
+        { from_user_id: peerId, to_user_id: currentUserId },
+      ],
+    })
+      .sort({ timestamp: 1, _id: 1 })
+      .limit(MAX_LEAVES)
+      .select('from_user_id timestamp deleted leaf')
+      .lean();
+
+    res.json({
+      leaves: rows.map(r => ({
+        id: r._id, fromId: r.from_user_id, timestamp: r.timestamp, deleted: !!r.deleted, leaf: r.leaf,
+      })),
+      truncated: rows.length === MAX_LEAVES,
+    });
+  } catch (error) {
+    logger.error('Fetch leaves failed', { message: error.message }, CTX);
+    res.status(500).json({ error: 'Failed to fetch transcript leaves' });
+  }
+});
+
 router.get('/:peerId', authenticateToken, async (req, res) => {
   const currentUserId = req.user.id;
   const peerId = req.params.peerId;

@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { logger } from '../utils/logger.js';
 import config from '../config/env.js';
 import { allocateQChatId } from '../utils/qchatId.js';
+import { leafForMessage } from '../utils/merkleLeaf.js';
 
 const MONGO_URI = config.mongoUri;
 
@@ -79,6 +80,10 @@ const messageSchema = new mongoose.Schema({
   reply_to_id:    { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null },
   deleted:        { type: Boolean, default: false },
   type:           { type: String, default: 'text', enum: ['text', 'image', 'audio', 'file'] },
+  // This message's leaf in the conversation's Merkle tree (hex). Computed from
+  // ciphertext and metadata, so the server can serve the whole tree without
+  // reading anything; every client recomputes the leaves it holds and checks.
+  leaf:           { type: String, default: null },
   // One entry per reacting user. `payload` is their whole emoji set, encrypted
   // to both participants, so the server stores it blind — it can upsert and
   // delete but never learns which emoji was used. `emoji` is the pre-v2
@@ -93,3 +98,17 @@ const messageSchema = new mongoose.Schema({
 messageSchema.index({ from_user_id: 1, to_user_id: 1, timestamp: -1 });
 
 export const Message = mongoose.model('Message', messageSchema);
+
+/** Give any message stored before the Merkle tree existed its leaf. Boot-time, idempotent. */
+export const backfillLeaves = async () => {
+  const cursor = Message.find({ $or: [{ leaf: null }, { leaf: { $exists: false } }] })
+    .select('from_user_id timestamp payload deleted').lean().cursor();
+  let ops = [];
+  let total = 0;
+  for await (const msg of cursor) {
+    ops.push({ updateOne: { filter: { _id: msg._id }, update: { $set: { leaf: leafForMessage(msg) } } } });
+    if (ops.length === 500) { await Message.bulkWrite(ops); total += ops.length; ops = []; }
+  }
+  if (ops.length) { await Message.bulkWrite(ops); total += ops.length; }
+  if (total) logger.db(`Backfilled Merkle leaves for ${total} message(s)`);
+};

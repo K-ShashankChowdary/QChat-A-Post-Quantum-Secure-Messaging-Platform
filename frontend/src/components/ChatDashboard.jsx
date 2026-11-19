@@ -5,11 +5,13 @@ import api, { SOCKET_URL, clearSession } from '../lib/api';
 import Logo from './visuals/Logo';
 import LatticeField from './visuals/LatticeField';
 import { useToast } from './visuals/Toast';
-import { encryptForRecipients, decryptEnvelope, b64encode, b64decode, calculateIntegrity, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
+import { encryptForRecipients, decryptEnvelope, b64encode, b64decode, publicKeyFromSecretKey, keyFingerprint } from '../crypto/encryption';
+import { useTranscriptTree, fetchTranscriptRoot } from '../hooks/useTranscriptTree';
+import { TranscriptBadge, TranscriptPanel, ProofDialog } from './TranscriptPanel';
 import { createMediaCrypto, withEncodedTransforms, mediaTransformSupport } from '../crypto/mediaTransport';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Send, Terminal, LogOut, Lock, Fingerprint,
+  Send, Terminal, LogOut, Lock, ShieldCheck,
   Users, Zap, Trash2, Video, PhoneOff, Mic, MicOff, VideoOff, Check, CheckCheck,
   Paperclip, X, Reply, Smile, File, StopCircle, Trash, Download,
   Copy, UserPlus, Search, Loader2, Menu, KeyRound, ShieldAlert, ArrowDown
@@ -60,11 +62,6 @@ const formatLastSeen = ts => {
   if (days < 7)  return `Last seen ${d.toLocaleDateString(undefined, { weekday: 'long' })} at ${fmt(ts)}`;
   return `Last seen ${d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}`;
 };
-
-/** Group a digest into 4-char blocks so the eye can actually compare two of them. */
-const formatDigest = (hex, blocks = 2) =>
-  (hex || '').toUpperCase().replace(/[^0-9A-Z]/gi, '').slice(0, blocks * 4)
-    .match(/.{1,4}/g)?.join(' ') || '';
 
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢'];
 
@@ -193,7 +190,13 @@ export default function ChatDashboard() {
   const [showConsole, setShowConsole]   = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1024);
   // Below lg the sidebar is a drawer rather than a permanent column.
   const [sidebarOpen, setSidebarOpen]   = useState(false);
-  const [integrity, setIntegrity]       = useState(null);
+  // Transcript Merkle tree UI: the integrity panel, a peer comparison in
+  // flight, and the proof dialog for one message.
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [compare, setCompare]           = useState(null);
+  const [proofView, setProofView]       = useState(null);
+  const compareWaitRef                  = useRef(null);
+  const transcriptRef                   = useRef(null);
   const [connStatus, setConnStatus]     = useState('connecting');
   
   // WhatsApp Features State
@@ -948,8 +951,15 @@ export default function ChatDashboard() {
 
     s.on('chat_cleared', ({ byUserId }) => {
       if (peerRef.current && String(peerRef.current.id) === String(byUserId)) {
-        setMessages([]); setIntegrity(null);
+        setMessages([]);
+        // A cleared chat is a legitimate rewrite of history; start the tree over
+        // rather than flagging every message as removed.
+        transcriptRef.current?.reset();
       }
+    });
+
+    s.on('transcript_check', ({ fromId, payload }) => {
+      handleTranscriptCheck(fromId, payload);
     });
 
     fetchUsers();
@@ -962,7 +972,8 @@ export default function ChatDashboard() {
   /* ─── Load history on peer change ─── */
   useEffect(() => {
     if (!peer) return;
-    setMessages([]); setIntegrity(null); setPeerTyping(false);
+    setMessages([]); setPeerTyping(false);
+    setCompare(null); setProofView(null); setShowTranscript(false);
     setHasMoreHistory(false);
     stickToBottomRef.current = true;
     loadHistory(peer.id);
@@ -984,7 +995,7 @@ export default function ChatDashboard() {
     return () => window.removeEventListener('focus', onFocus);
   }, [messages]);
 
-  /* ─── Scroll + integrity on message update ─── */
+  /* ─── Scroll on message update ─── */
   useEffect(() => {
     // Only follow new messages when the reader is already at the bottom.
     if (stickToBottomRef.current) bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1004,48 +1015,105 @@ export default function ChatDashboard() {
     return () => ro.disconnect();
   }, [peer?.id, measureAtBottom]);
 
-  // Integrity depends only on the message chain. Recomputing it on replyingTo
-  // also scroll-jumped the view every time a reply was picked.
-  //
-  // The chain folds in msg.text, and an attachment's text is its entire base64
-  // envelope, so a thread with a few images means tens of megabytes of SHA-256
-  // per run. Keying the effect on `messages` re-ran it for read receipts and
-  // reactions too, which change none of its inputs. This key moves only when
-  // the chain genuinely does.
-  //
-  // Only messages both devices hold identically are chained: acknowledged by
-  // the server (a temp id and a local clock never match the peer's copy), not
-  // deleted, and actually decrypted.
-  const chainable = (m) => !m.error && !m.deleted && isRealId(m.id);
+  /* ─── Transcript Merkle tree (objective 2) ───
+     All of the state lives in the hook; see hooks/useTranscriptTree.js. */
+  const transcript = useTranscriptTree({
+    myId: currentUser.id ? String(currentUser.id) : null,
+    peerId: peer?.id ? String(peer.id) : null,
+    messages,
+  });
+  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
 
-  const chainKey = useMemo(
-    () => messages
-      .filter(chainable)
-      .map(m => `${m.id}:${new Date(m.timestamp).getTime()}`)
-      .join('|'),
-    [messages],
-  );
-
-  useEffect(() => {
-    const entries = messages.filter(chainable).map(m => ({
-      from: m.isMine ? currentUser.id : m.fromId,
-      id: m.id,
-      timestamp: m.timestamp,
-      text: m.text,
-    }));
-    let cancelled = false;
-    if (entries.length) {
-      calculateIntegrity(entries)
-        .then(digest => { if (!cancelled) setIntegrity(digest); })
-        .catch(() => { if (!cancelled) setIntegrity(null); });
-    } else {
-      setIntegrity(null);
+  /** Ask the peer's device for its root over the same messages, and compare. */
+  const compareWithPeer = async () => {
+    const target = peerRef.current;
+    if (!target?.public_key || !transcript.ready) return;
+    try {
+      const mine = await transcript.rootAt(transcript.size);
+      const nonce = b64encode(crypto.getRandomValues(new Uint8Array(12)));
+      const payload = await encryptForRecipients(
+        JSON.stringify({ kind: 'request', nonce, size: mine.size, root: mine.root }),
+        [{ id: String(target.id), publicKey: b64decode(target.public_key) }],
+      );
+      clearTimeout(compareWaitRef.current?.timer);
+      setCompare({ state: 'waiting' });
+      compareWaitRef.current = {
+        nonce,
+        peerId: String(target.id),
+        timer: setTimeout(() => {
+          if (compareWaitRef.current?.nonce !== nonce) return;
+          compareWaitRef.current = null;
+          setCompare({ state: 'timeout' });
+        }, 8000),
+      };
+      socketRef.current?.emit('transcript_check', { toId: target.id, payload });
+      addLog(`Asked ${target.username} for their Merkle root over ${mine.size} messages`, 'cyan');
+    } catch (err) {
+      setCompare({ state: 'error' });
+      addLog(`Could not start the comparison: ${err.message}`, 'pink');
     }
-    return () => { cancelled = true; };
-    // messages is deliberately not a dependency: chainKey is its distillation,
-    // and depending on both would defeat the point.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chainKey]);
+  };
+
+  /** Both halves of the comparison: answer a request, or settle our own. */
+  const handleTranscriptCheck = async (fromId, payload) => {
+    const from = String(fromId);
+    try {
+      const msg = JSON.parse(await decryptEnvelope(payload, currentUser.id, privateKey));
+      const open = String(peerRef.current?.id) === from && transcriptRef.current?.ready;
+      // The verified tree if that chat is open here; otherwise rebuilt from the
+      // server's leaves for that conversation.
+      const rootAt = (size) => (open ? transcriptRef.current.rootAt(size) : fetchTranscriptRoot(from, size));
+
+      if (msg.kind === 'request') {
+        const sender = await findContact(from);
+        if (!sender?.public_key) return;
+        const mine = await rootAt(msg.size);
+        const sealed = await encryptForRecipients(
+          JSON.stringify({ kind: 'reply', nonce: msg.nonce, size: mine.size, root: mine.root }),
+          [{ id: from, publicKey: b64decode(sender.public_key) }],
+        );
+        socketRef.current?.emit('transcript_check', { toId: from, payload: sealed });
+        toast.info(`${sender.username} compared your conversation's Merkle root with theirs.`);
+        addLog(`Answered a transcript comparison from ${sender.username} (${mine.size} messages)`, 'cyan');
+      } else if (msg.kind === 'reply') {
+        const pending = compareWaitRef.current;
+        if (!pending || pending.nonce !== msg.nonce || pending.peerId !== from) return;
+        clearTimeout(pending.timer);
+        compareWaitRef.current = null;
+        // Compare over the shorter history: the peer may not have the newest
+        // message yet, and that is not a disagreement.
+        const mine = await rootAt(msg.size);
+        const match = mine.size === msg.size && mine.root === msg.root;
+        setCompare({ state: match ? 'match' : 'mismatch', size: msg.size });
+        addLog(`Transcript comparison: ${match ? 'roots match' : 'ROOTS DIFFER'} over ${msg.size} messages`, match ? 'green' : 'pink');
+      }
+    } catch (err) {
+      addLog(`Transcript comparison failed: ${err.message}`, 'pink');
+      if (compareWaitRef.current?.peerId === from) {
+        clearTimeout(compareWaitRef.current.timer);
+        compareWaitRef.current = null;
+        setCompare({ state: 'error' });
+      }
+    }
+  };
+
+  const openProof = async (msg) => {
+    setProofView({ proof: null, missing: false, preview: previewText(msg) });
+    const proof = await transcript.proofFor(msg.id);
+    setProofView(v => (v ? { ...v, proof, missing: !proof } : v));
+  };
+
+  const jumpToMessage = (id) => {
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) {
+      toast.info('That message is further back — scroll up to load it.');
+      return;
+    }
+    setShowTranscript(false);
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('ring-2', 'ring-rose-400/70', 'rounded-2xl');
+    setTimeout(() => el.classList.remove('ring-2', 'ring-rose-400/70', 'rounded-2xl'), 2400);
+  };
 
   const fetchUsers = useCallback(async () => {
     try {
@@ -1319,7 +1387,10 @@ export default function ChatDashboard() {
         markFresh(tempId);
         setMessages(prev => [...prev, {
           id: tempId, text: textToSend, isMine: true, timestamp: new Date(),
-          delivered: false, read: false, type: msgType, replyToId
+          delivered: false, read: false, type: msgType, replyToId,
+          // Kept so this device can compute the message's Merkle leaf itself
+          // once the server acks it with a real id and timestamp.
+          fromId: String(currentUser.id), payload,
         }]);
       }
 
@@ -1489,7 +1560,8 @@ export default function ChatDashboard() {
 
     try {
       await api.delete(`/api/messages/${peer.id}`);
-      setMessages([]); setIntegrity(null);
+      setMessages([]);
+      transcript.reset();
       toast.success('Conversation cleared.');
     } catch (err) {
       toast.error(`Could not clear chat: ${err.message}`);
@@ -1505,6 +1577,10 @@ export default function ChatDashboard() {
     clearSession();
     navigate('/login');
   };
+
+  // The self-view is shaped like the camera that feeds it (16:9, 4:3, or a
+  // phone held upright), so nothing is cropped away.
+  const localAspect = localStream?.getVideoTracks?.()[0]?.getSettings?.().aspectRatio || 4 / 3;
 
   const renderBubbleContent = (msg) => {
     if (msg.deleted) {
@@ -1913,17 +1989,12 @@ export default function ChatDashboard() {
                 </div>
               </div>
               <div className="flex items-center gap-2 flex-shrink-0">
-                {integrity && (
-                  <span
-                    title={`Transcript digest: ${formatDigest(integrity, 8)}\nA SHA-256 chain over the messages loaded here (sender, id, time, text). With the same messages loaded, both devices show the same value; an altered, missing or reordered message changes it.`}
-                    className="hidden md:inline-flex items-center gap-1.5 text-[10px] font-semibold tracking-wide
-                               text-emerald-300/90 bg-emerald-400/[0.08] border border-emerald-400/20
-                               px-2.5 py-1 rounded-full mr-1 cursor-default"
-                  >
-                    <Fingerprint size={11} className="text-emerald-400" />
-                    <span className="font-mono tracking-[0.08em]">{formatDigest(integrity)}</span>
-                  </span>
-                )}
+                <TranscriptBadge
+                  status={transcript.status}
+                  root={transcript.root}
+                  size={transcript.size}
+                  onClick={() => setShowTranscript(true)}
+                />
 
                 {/* One control group, one icon size — not three loose buttons. */}
                 <div className="flex items-center gap-0.5 bg-white/[0.03] border border-white/[0.06] rounded-xl p-1">
@@ -1965,38 +2036,67 @@ export default function ChatDashboard() {
                       </div>
                     </div>
                   ) : (
-                    <div className="relative flex-1 bg-black">
-                      <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-full object-cover" />
-                      <div className="absolute top-4 right-4 w-32 md:w-48 aspect-[3/4] bg-navy-900 rounded-xl overflow-hidden shadow-2xl border border-white/10">
-                        <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-                      </div>
-                      {mediaProtection && (
-                        <div className={`absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-semibold backdrop-blur-md border ${
-                          mediaProtection === 'pq'
-                            ? 'bg-emerald-400/10 border-emerald-400/30 text-emerald-300'
-                            : mediaProtection === 'pending'
-                            ? 'bg-cyan-400/10 border-cyan-400/30 text-cyan-300'
-                            : 'bg-amber-400/10 border-amber-400/30 text-amber-300'
-                        }`}>
-                          <Lock size={11} />
-                          {mediaProtection === 'pq'
-                            ? 'Video sealed · ML-KEM-768 + AES-256-GCM'
-                            : mediaProtection === 'pending'
-                            ? 'Negotiating sealed media…'
-                            : 'Video on DTLS-SRTP only — not quantum-safe'}
+                    // min-h-0 and an absolutely placed <video> keep the stage the size of
+                    // the pane. As a plain flex child the video's intrinsic height set the
+                    // stage's minimum, so a 4:3 camera pushed the controls off the bottom.
+                    <div className="relative flex-1 min-h-0 bg-black overflow-hidden">
+                      {/* contain, not cover: the whole frame is shown, letterboxed if
+                          needed, instead of a cropped close-up of the middle. */}
+                      <video ref={remoteVideoRef} autoPlay playsInline className="absolute inset-0 w-full h-full object-contain" />
+                      {!remoteStream && (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-slate-400">
+                          <Loader2 size={22} className="animate-spin text-cyan-400" />
+                          <p className="text-sm">
+                            {callStatus === 'calling' ? `Calling ${(callPeer || peer).username}…` : 'Connecting…'}
+                          </p>
                         </div>
                       )}
 
-                      <div className="absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-navy-900/80 backdrop-blur-lg px-6 py-3 rounded-full border border-white/10">
-                        <button onClick={toggleMute} className={`p-3 rounded-full ${isMuted ? 'bg-rose-500/20 text-rose-500' : 'bg-white/10 text-white hover:bg-white/20'}`}>
+                      {/* Self-view follows the camera's own shape and is mirrored, like
+                          every call app, instead of a portrait box cropping a landscape feed. */}
+                      <div
+                        className="absolute top-4 right-4 z-10 w-28 sm:w-40 md:w-52 bg-navy-900 rounded-xl overflow-hidden shadow-2xl border border-white/15"
+                        style={{ aspectRatio: localAspect }}
+                      >
+                        <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover [transform:scaleX(-1)]" />
+                        {isVideoOff && (
+                          <div className="absolute inset-0 flex items-center justify-center bg-navy-900 text-slate-500">
+                            <VideoOff size={18} />
+                          </div>
+                        )}
+                      </div>
+
+                      {mediaProtection && (
+                        <div className={`absolute top-4 left-4 z-10 max-w-[calc(100%-10rem)] sm:max-w-[calc(100%-13rem)] flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-semibold bg-navy-950/75 backdrop-blur-md border shadow-lg ${
+                          mediaProtection === 'pq'
+                            ? 'border-emerald-400/40 text-emerald-300'
+                            : mediaProtection === 'pending'
+                            ? 'border-cyan-400/40 text-cyan-300'
+                            : 'border-amber-400/40 text-amber-300'
+                        }`}>
+                          <Lock size={11} className="flex-shrink-0" />
+                          <span className="truncate">
+                            {mediaProtection === 'pq'
+                              ? 'Video sealed · ML-KEM-768 + AES-256-GCM'
+                              : mediaProtection === 'pending'
+                              ? 'Negotiating sealed media…'
+                              : 'Video on DTLS-SRTP only — not quantum-safe'}
+                          </span>
+                        </div>
+                      )}
+
+                      <div className="absolute inset-x-0 bottom-5 z-10 flex justify-center pointer-events-none">
+                      <div className="pointer-events-auto flex items-center gap-4 bg-navy-950/75 backdrop-blur-lg px-5 py-2.5 rounded-full border border-white/10 shadow-xl">
+                        <button onClick={toggleMute} aria-label={isMuted ? 'Unmute' : 'Mute'} className={`p-3 rounded-full ${isMuted ? 'bg-rose-500/20 text-rose-500' : 'bg-white/10 text-white hover:bg-white/20'}`}>
                           {isMuted ? <MicOff size={20}/> : <Mic size={20}/>}
                         </button>
-                        <button onClick={toggleVideo} className={`p-3 rounded-full ${isVideoOff ? 'bg-rose-500/20 text-rose-500' : 'bg-white/10 text-white hover:bg-white/20'}`}>
+                        <button onClick={toggleVideo} aria-label={isVideoOff ? 'Turn camera on' : 'Turn camera off'} className={`p-3 rounded-full ${isVideoOff ? 'bg-rose-500/20 text-rose-500' : 'bg-white/10 text-white hover:bg-white/20'}`}>
                           {isVideoOff ? <VideoOff size={20}/> : <Video size={20}/>}
                         </button>
-                        <button onClick={endCall} className="p-3 rounded-full bg-rose-500 text-white hover:bg-rose-600 shadow-lg shadow-rose-500/20">
+                        <button onClick={endCall} aria-label="End call" className="p-3 rounded-full bg-rose-500 text-white hover:bg-rose-600 shadow-lg shadow-rose-500/20">
                           <PhoneOff size={20}/>
                         </button>
+                      </div>
                       </div>
                     </div>
                   )}
@@ -2144,6 +2244,17 @@ export default function ChatDashboard() {
                             className="p-2 rounded-full bg-navy-800 text-slate-400 hover:text-rose-400 hover:bg-navy-700 transition-colors"
                           >
                             <Trash size={14} />
+                          </button>
+                        )}
+                        {isRealId(msg.id) && (
+                          <button
+                            type="button"
+                            title="Verify in the Merkle tree"
+                            aria-label="Verify this message in the Merkle tree"
+                            onClick={() => openProof(msg)}
+                            className="p-2 rounded-full bg-navy-800 text-slate-400 hover:text-emerald-300 hover:bg-navy-700 transition-colors"
+                          >
+                            <ShieldCheck size={14} />
                           </button>
                         )}
                         {renderReactionButton(msg, msg.isMine ? 'right' : 'left')}
@@ -2333,6 +2444,26 @@ export default function ChatDashboard() {
           </div>
         )}
       </main>
+
+      {peer && (
+        <TranscriptPanel
+          open={showTranscript}
+          onClose={() => setShowTranscript(false)}
+          tree={transcript}
+          peerName={peer.username}
+          onCompare={compareWithPeer}
+          compare={compare}
+          onAccept={async () => { await transcript.acceptCurrent(); toast.success('Current history accepted as the new checkpoint.'); }}
+          onJump={jumpToMessage}
+        />
+      )}
+      <ProofDialog
+        open={!!proofView}
+        onClose={() => setProofView(null)}
+        proof={proofView?.proof}
+        missing={proofView?.missing}
+        preview={proofView?.preview}
+      />
     </div>
   );
 }

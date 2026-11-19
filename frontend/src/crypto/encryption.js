@@ -318,48 +318,9 @@ export async function keyFingerprint(publicKey) {
     .join(' ');
 }
 
-/* ─── Integrity chain ───
-     H_0 = 0^256
-     H_n = SHA-256( H_{n-1} ‖ encode(sender_n, id_n, time_n, text_n) )
-
-   Every input is something both participants hold identically: the sender's
-   user id rather than "mine / theirs", and the server's message id and
-   timestamp rather than a local clock. So two devices with the same messages
-   loaded compute the same digest, and comparing them is a real check. (The
-   first version hashed 'out' on one side and 'in' on the other, so the two
-   could never agree.)
-
-   encode() is a JSON array, which is unambiguous where bare concatenation is
-   not: "ab" + "c" and "a" + "bc" would otherwise hash identically.
-
-   `entries` is [{ from, id, timestamp, text }]. It is put into canonical
-   (time, id) order here, so arrival order on either device can't matter. */
-export async function calculateIntegrity(entries) {
-  if (!Array.isArray(entries) || entries.length === 0) return null;
-
-  try {
-    const ordered = entries
-      .map(e => ({ ...e, time: new Date(e.timestamp).toISOString() }))
-      .sort((a, b) => (a.time === b.time
-        ? (String(a.id) < String(b.id) ? -1 : 1)
-        : (a.time < b.time ? -1 : 1)));
-
-    const encoder = new TextEncoder();
-    let current = new Uint8Array(32);
-    for (const e of ordered) {
-      const record = encoder.encode(JSON.stringify([String(e.from), String(e.id), e.time, String(e.text ?? '')]));
-      const combined = new Uint8Array(current.length + record.length);
-      combined.set(current);
-      combined.set(record, current.length);
-      current = new Uint8Array(await crypto.subtle.digest('SHA-256', combined));
-    }
-
-    return [...current].map(b => b.toString(16).padStart(2, '0')).join('');
-  } catch (error) {
-    console.error('Integrity check failed:', error);
-    throw new Error('INTEGRITY_CALCULATION_FAILED');
-  }
-}
+/* The transcript integrity check (objective 2) lives in ./merkle.js — an
+   RFC 6962 Merkle tree over every message, which replaced the earlier linear
+   hash chain. */
 
 // Convert Uint8Array to Base64 using chunking to prevent max call stack limits and memory bloat
 export function b64encode(uint8) {

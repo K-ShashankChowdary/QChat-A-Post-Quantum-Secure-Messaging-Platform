@@ -6,7 +6,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import morgan from 'morgan';
 import config from './config/env.js';
-import { connectDB, backfillQChatIds, User, Message } from './db/database.js';
+import { connectDB, backfillQChatIds, backfillLeaves, User, Message } from './db/database.js';
 import authRoutes from './routes/auth.js';
 import messageRoutes from './routes/messages.js';
 import userRoutes from './routes/users.js';
@@ -14,11 +14,13 @@ import { authenticateSocket } from './middleware/auth.js';
 import { logger } from './utils/logger.js';
 import { isValidObjectId, approximateSize } from './utils/validation.js';
 import { serializeMessage } from './utils/serialize.js';
+import { leafForMessage } from './utils/merkleLeaf.js';
 import mongoose from 'mongoose';
 
 // ── Connect to MongoDB ──
 connectDB()
   .then(backfillQChatIds)
+  .then(backfillLeaves)
   .catch(err => logger.error('Startup database work failed', { message: err.message }, 'DB'));
 
 const app = express();
@@ -201,6 +203,9 @@ io.on('connection', async (socket) => {
         reply_to_id:    safeReplyTo,
         delivered:      recipientOnline,
       });
+      // _id and timestamp are assigned at construction, so the leaf can be
+      // computed before the first save rather than with a second write.
+      msg.leaf = leafForMessage(msg);
       await msg.save();
       logger.info('Message saved', { id: msg._id, fromId: userId, toId }, 'Socket');
       reachable.add(String(toId));
@@ -237,6 +242,18 @@ io.on('connection', async (socket) => {
       io.to(String(toId)).emit('webrtc_signal', { fromId: userId, signalPayload });
     } catch (err) {
       logger.error('webrtc_signal failed', { message: err.message }, 'Socket');
+    }
+  });
+
+  // Two participants comparing their Merkle roots. The payload is sealed to the
+  // other side like any signal; the server only relays it.
+  socket.on('transcript_check', async ({ toId, payload } = {}) => {
+    try {
+      if (!payload || typeof payload !== 'object' || approximateSize(payload) > 16 * 1024) return;
+      if (!(await canReach(toId))) return;
+      io.to(String(toId)).emit('transcript_check', { fromId: userId, payload });
+    } catch (err) {
+      logger.error('transcript_check failed', { message: err.message }, 'Socket');
     }
   });
 
@@ -283,6 +300,9 @@ io.on('connection', async (socket) => {
       if (!msg) {
         return logger.warn('delete_message: not found or not owned', { messageId, userId }, 'Socket');
       }
+      // A delete changes the leaf to the "deleted" form, which every client
+      // computes identically — so it reads as a delete, not as tampering.
+      await Message.updateOne({ _id: msg._id }, { $set: { leaf: leafForMessage(msg) } });
 
       io.to(String(msg.to_user_id)).emit('message_deleted', { messageId });
       io.to(String(msg.from_user_id)).emit('message_deleted', { messageId });
