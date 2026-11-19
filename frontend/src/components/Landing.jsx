@@ -74,7 +74,7 @@ const SPEC = [
   ['Shared secret', '32 bytes'],
   ['Key derivation', 'HKDF-SHA256 · random salt + context string'],
   ['Content cipher', 'AES-256-GCM · 12-byte nonce · 16-byte tag'],
-  ['Integrity', 'SHA-256 rolling hash chain'],
+  ['Integrity', 'SHA-256 Merkle tree (RFC 6962)'],
   ['Messaging transport', 'Socket.io · JWT-authenticated handshake'],
   ['Call media', 'WebRTC · DTLS-SRTP, signalling post-quantum encrypted'],
 ];

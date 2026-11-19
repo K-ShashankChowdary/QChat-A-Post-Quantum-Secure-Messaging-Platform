@@ -17,7 +17,7 @@ ESM throughout (`"type": "module"` both sides). Node 20+.
 | # | Synopsis objective | Status |
 |---|---|---|
 | 1 | Hybrid ML-KEM + AES-256 for messages and key exchange | **done** |
-| 2 | Merkle tree so chat records are tamper-proof | **partial** — linear SHA-256 hash chain, not a branching tree (`FEAT-3`) |
+| 2 | Merkle tree so chat records are tamper-proof | **done** — RFC 6962 Merkle tree with checkpoints, named findings, inclusion proofs and peer root comparison (§4 below) |
 | 3 | On-device AI phishing detection, no server exposure | **not started** (`FEAT-2`) |
 | 4 | WebRTC video with PQ protection on signalling **and** media | **done** (`7e71230`), verified Chrome↔Chrome |
 
@@ -42,6 +42,9 @@ README's phrasing imply otherwise.
 | `utils/validation.js` (66) | Username, password, public key, key-backup shape. |
 | `utils/logger.js` (48) | Structured console logger with contexts. |
 | `utils/serialize.js` | `serializeMessage` — the one wire shape for a message (relay, offline delivery, history). |
+| `utils/merkleLeaf.js` | Server-side Merkle leaf; mirrors `frontend/src/crypto/merkle.js`. |
+| `scripts/tamper.js` | Merkle demo: alter a message's time/payload or remove it, directly in Mongo. |
+| `test/merkleLeaf.test.js` | `npm test` — server and browser leaves must be identical. |
 | `scripts/delete-user.js` (49) | Deletes an account + its messages + contact refs. |
 
 ### Frontend (`frontend/src/`, ~2,100 lines)
@@ -51,7 +54,11 @@ README's phrasing imply otherwise.
 | `components/Landing.jsx` (399) | Explainer page: threat model, pipeline, spec table, server-knowledge split. |
 | `components/Login.jsx` (178) | **Key recovery lives here** — three branches (§5). |
 | `components/Register.jsx` (178) | Keygen + wrap + register. |
-| `crypto/encryption.js` | v2 write + v1/v2 read, key backup, key identity, integrity chain, b64 helpers. (The v1 *writer* `encryptMessage` was removed; nothing sends v1.) |
+| `crypto/encryption.js` | v2 write + v1/v2 read, key backup, key identity, b64 helpers. (The v1 *writer* `encryptMessage` and the old hash chain were removed.) |
+| `crypto/merkle.js` (+ `merkle.test.js`) | RFC 6962 tree, inclusion proofs, checkpoint comparison. `npm test`. |
+| `hooks/useTranscriptTree.js` | Builds, verifies and checkpoints the open chat's tree. |
+| `components/TranscriptPanel.jsx` | Header badge, integrity panel, inclusion-proof dialog. |
+| `lib/checkpointStore.js` | IndexedDB checkpoints, in-memory fallback. |
 | `crypto/mediaCrypto.js` (160) | Per-frame cipher for call media. |
 | `crypto/mediaTransport.js` (83) | Wires the frame cipher into an `RTCPeerConnection`. |
 | `crypto/mediaTransform.worker.js` (31) | Firefox/Safari path. **Never actually executed.** |
@@ -140,28 +147,40 @@ encrypt a message *with* ML-KEM; you use it to agree a symmetric key and let AES
 That is what "hybrid" means here — and it is also why the KDF step matters: everything
 downstream depends on turning a 32-byte KEM output into a proper key.
 
-### Integrity chain (`calculateIntegrity`)
+### Transcript Merkle tree (objective 2)
+Files: `crypto/merkle.js` (pure, runs in browser and Node), `hooks/useTranscriptTree.js`,
+`components/TranscriptPanel.jsx`, `lib/checkpointStore.js`, `backend/utils/merkleLeaf.js`.
 ```
-H_0 = 32 zero bytes
-H_n = SHA-256( H_{n-1} ‖ JSON([sender_user_id, server_id, iso_timestamp, text]) )
+leaf  = SHA-256(0x00 ‖ JSON["qchat.leaf.v1", fromId, id, ISO ts, SHA-256(canonicalJson(payload)) | "deleted"])
+node  = SHA-256(0x01 ‖ left ‖ right)          odd node promoted, never duplicated
+order = (timestamp, id)                       empty root = SHA-256("")
 ```
-Input is `[{ from, id, timestamp, text }]`, sorted into canonical (time, id) order inside the
-function. Returns full hex; the header shows 8 chars, the tooltip 32.
-
-**Every field is one both participants hold identically**, so both devices compute the same
-digest and comparing them is a real check. The first version hashed `'out'` on the sender's
-side and `'in'` on the recipient's (and mixed a local `Date.toString()` with server ISO
-strings), so the two digests could never match — while the tooltip claimed they should.
-Only acknowledged (`isRealId`), non-deleted, decrypted messages are chained. JSON encoding,
-not concatenation, so `"ab"+"c"` and `"a"+"bc"` don't collide.
-
-What it adds over GCM: GCM already rejects an edited ciphertext. The chain catches a server
-that **drops, reorders or substitutes** messages in one party's view. It does *not* catch a
-server forging a message into both views — see the ML-DSA gap in §7.
-
-**This is a hash chain, not a Merkle tree.** It detects that *something* changed; it cannot
-prove *which* message is intact without replaying the whole chain, and it has no branching
-structure or inclusion proofs. Know the difference cold — it is objective 2.
+- RFC 6962 exactly — the test suite checks the CT reference vectors, a literal recursive
+  MTH for 0..100 leaves, and every proof for n ≤ 64. `verifyInclusion` is RFC 9162
+  §2.1.3.2 (no side hints), so it independently checks `inclusionProof`.
+- Leaves are over **ciphertext**, so the server stores `Message.leaf` (set on send,
+  recomputed on delete, backfilled at boot by `backfillLeaves`) and serves them all from
+  `GET /api/messages/:peerId/leaves`. The tree spans the whole history, not the loaded page.
+- `merkleLeaf.js` must match `merkle.js` byte for byte; `backend/test/merkleLeaf.test.js`
+  imports both and fails on any drift. Change the record format in both or neither, and
+  bump `qchat.leaf.v1` if you do.
+- `useTranscriptTree`: fetch leaves → recompute leaves of loaded messages (a mismatch with
+  the server list is a `served` finding) → merge (local wins) → build → once per opened chat
+  `compareWithCheckpoint` against IndexedDB → findings `modified` / `removed` / `inserted`
+  (back-dated) / `deleted` (benign). Status `first | ok | benign | tampered | checking |
+  unavailable`. Checkpoint is re-saved only while not tampered, so a warning survives
+  reloads until **Accept current history**. `chat_cleared` / clear chat call `reset()`.
+- Optimistic bubbles carry `fromId` + `payload` so the sender's own leaf is computed locally
+  once `message_sent` supplies the real id and timestamp.
+- **Compare with peer**: `transcript_check` socket event (relayed like signals, `canReach`
+  gated), payload ML-KEM sealed: `{kind:'request', nonce, size, root}` → the peer answers
+  `{kind:'reply', nonce, size', root'}` over its own prefix (its open tree, or
+  `fetchTranscriptRoot`). The requester compares its own root at `size'`, so a peer that
+  hasn't received the newest message isn't a false mismatch.
+- **Why the timestamp is in the leaf:** AES-GCM doesn't cover it. `scripts/tamper.js <id>
+  time` proves it — the message still opens, and only the tree flags it.
+- Limits: proves no rewrite *after* a device verified; says nothing about authorship
+  (ML-DSA gap); checkpoints are per browser.
 
 ---
 
@@ -394,8 +413,9 @@ What changed, so you know what to expect if you remember the old text:
   sign-in branches and stating the password-reaches-the-server limitation openly.
 - **README §5.1 is new** — post-quantum media. The README previously described only encrypted
   *signalling*, which understated objective 4.
-- **README §4** retitled: "Integrity Hash Chain (Merkle tree: planned, not yet built)". The
-  old title claimed a structure the code does not implement.
+- **README §4** was retitled "Integrity Hash Chain (Merkle tree: planned, not yet built)"
+  in Sep 2026, because the old title claimed a structure the code did not implement. In
+  Nov 2026 the tree was built and §4 became "Merkle-Tree Transcript Integrity".
 - **README §2.2 / §5 / §6** snippets corrected to match the code: key storage is by user id,
   signalling uses `encryptForRecipients` (v2) and room-based relay with no client `fromId`,
   and the double-encryption claim is gone (v2 ended it).
@@ -419,8 +439,9 @@ committed** — don't cite it as repo-verifiable.
 
 **Still worth knowing:** the slide deck (`Major_Project_Presentation.pptx`) names **Redis and
 Docker** in its tech stack; neither appears in any dependency list. The README never did, so
-this is a slides-only correction. There are also **no tests committed** anywhere in the repo —
-the 13 media-cipher tests were run ad hoc, so do not cite them as repo-verifiable.
+this is a slides-only correction. The only committed tests are the Merkle suites (`npm test` in
+frontend and backend); the 13 media-cipher tests were run ad hoc, so do not cite them as
+repo-verifiable.
 
 ## 11. Gotchas that already cost real time
 
@@ -460,7 +481,7 @@ the 13 media-cipher tests were run ad hoc, so do not cite them as repo-verifiabl
 - **OPS-4** — attachments are base64, inline in the `Message` document. Blob storage with a
   reference + key material in the payload would roughly halve storage and bandwidth.
 - **FEAT-2** — on-device AI phishing detection. Objective 3. No code exists.
-- **FEAT-3** — true branching Merkle tree. Objective 2. The hash chain is the foundation.
+- ~~**FEAT-3** — true branching Merkle tree.~~ Done (Nov 2026): RFC 6962 tree, checkpoints, proofs, peer compare.
 - **(unticketed)** ML-DSA signatures on every payload — closes the forged-sender gap.
 - **(unticketed)** commit the e2e suite as a real regression test.
 

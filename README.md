@@ -18,7 +18,7 @@ so that it holds only ciphertext it cannot open.
 1. [Objectives and status](#1-objectives-and-status)
 2. [In-depth cryptographic pipeline](#2-in-depth-cryptographic-pipeline-the-core)
 3. [Real-time network and synchronization](#3-real-time-network--synchronization-logic)
-4. [Integrity hash chain](#4-integrity-hash-chain-merkle-tree-planned-not-yet-built)
+4. [Merkle-tree transcript integrity](#4-merkle-tree-transcript-integrity)
 5. [Secure real-time communication (WebRTC)](#5-secure-real-time-communication-webrtc-video-calling)
 6. [Messaging features](#6-messaging-features-attachments-replies-reactions-delete-presence)
 7. [Identity, contacts and access control](#7-identity-contacts--access-control)
@@ -36,15 +36,14 @@ The five objectives from Chapter 1.2 of the report, mapped to the delivered syst
 | # | Objective | Status |
 |---|---|---|
 | 1 | Hybrid encryption framework combining **ML-KEM** with **AES-256** for secure key exchange and message confidentiality | ✅ **Delivered.** ML-KEM-768 encapsulation per recipient, AES-256-GCM over the content, HKDF-SHA256 key derivation. Payload v2 encrypts once and wraps the content key per party — a measured **49.9%** reduction in stored bytes over the naive approach. |
-| 2 | Data integrity through a **Merkle hash chain**, detecting unauthorized modification of chat history | 🟡 **Delivered as a chain; the tree is next.** Every message is linked to its predecessor by SHA-256 over values both participants hold identically — sender id, server id, server timestamp and text — so both devices compute the **same** digest, shown in the chat header. If the server drops, reorders or swaps a message on one side, the two digests disagree. The branching Merkle tree with per-message inclusion proofs is `FEAT-3`. |
+| 2 | Data integrity through a **Merkle hash chain**, detecting unauthorized modification of chat history | ✅ **Delivered.** Every conversation is an RFC 6962 **Merkle tree**: each message is a leaf hashed from its sender, id, timestamp and ciphertext, and the root is shown in the chat header. Each device checkpoints the tree and, on every visit, names any message that was **modified, removed or back-dated** since — including a rewritten timestamp, which encryption alone cannot detect. Any message can be proven a member of the history with a ⌈log₂ n⌉-hash **inclusion proof**, and the two participants can compare roots in one click. |
 | 3 | On-device **AI phishing detection**, preserving privacy by keeping analysis local | 🔜 **Phase II.** The architecture reserves the AI Layer and the client-side inference boundary it requires; the model itself is future scope, consistent with report §5.2. |
 | 4 | Secure real-time **WebRTC** video calling with post-quantum protection of **signaling and media** | ✅ **Delivered, and extended.** Signaling is ML-KEM sealed, and *every encoded media frame* is additionally sealed with AES-256-GCM under an ML-KEM-derived key — so the audio and video are protected by post-quantum cryptography, not only by WebRTC's classical DTLS-SRTP. Verified in live two-party calls. |
 | 5 | **Scalable and modular architecture** supporting future enhancement | ✅ **Delivered.** Clean layer and module separation (§8), env-driven configuration, stateless JWT auth, room-based socket fan-out and cursor-paged history — all of which scale horizontally. Formal load characterisation is scheduled as `OPS-1`. |
 
-**Three of five objectives are fully delivered**, including the full post-quantum media
-path that the report lists only as a target. Integrity is delivered as a hash chain, with
-the tree as the next step, and on-device AI detection is deliberately sequenced into
-Phase II.
+**Four of five objectives are delivered**, including the full post-quantum media path
+that the report lists only as a target and a Merkle tree with inclusion proofs. On-device
+AI detection is deliberately sequenced into Phase II.
 
 ---
 
@@ -347,64 +346,104 @@ messageSchema.index({ from_user_id: 1, to_user_id: 1, timestamp: -1 });
 
 ---
 
-## 4. Integrity Hash Chain (Merkle tree: planned, not yet built)
-*File: `frontend/src/crypto/encryption.js -> calculateIntegrity`*
+## 4. Merkle-Tree Transcript Integrity
+*Files: `frontend/src/crypto/merkle.js` (tree), `frontend/src/hooks/useTranscriptTree.js`
+(verification), `frontend/src/components/TranscriptPanel.jsx` (UI),
+`backend/utils/merkleLeaf.js` (server leaves)*
 
-To prevent the Zero-Knowledge backend from arbitrarily destroying chat sequences or executing selective-deletion assaults, QChat implements a block-synchronization hash string mathematically mirroring blockchain technology.
+Encryption stops the server *reading* a conversation. It does not stop it *rewriting* one:
+dropping a message, slipping one into the past, or changing when a message was sent. The
+Merkle tree makes every such change visible, and names the message.
 
-#### Hash Formalism
+#### 4.1 Construction (RFC 6962, as used by Certificate Transparency)
 
-$$H_0 = 0^{256}$$
+$$\mathrm{leaf}_i = \mathrm{SHA\text{-}256}\left(\mathtt{0x00} \,\|\, \mathrm{record}_i\right)$$
 
-$$H_n = \mathrm{SHA\text{-}256}\!\left(H_{n-1} \,\|\, \mathrm{enc}\left(\mathrm{sender}_n,\ \mathrm{id}_n,\ t_n,\ \mathrm{text}_n\right)\right)$$
+$$\mathrm{node} = \mathrm{SHA\text{-}256}\left(\mathtt{0x01} \,\|\, \mathrm{left} \,\|\, \mathrm{right}\right)$$
 
-where $\|$ is byte concatenation, $H_0$ is 256 zero bits, and $\mathrm{enc}$ is a JSON
-array — unambiguous where bare concatenation is not (`"ab"+"c"` and `"a"+"bc"` would
-otherwise hash alike). Messages are put in canonical $(t_n, \mathrm{id}_n)$ order first,
-so arrival order on either device cannot change the result.
+$$\mathrm{MTH}(D_n) = \mathrm{SHA\text{-}256}\left(\mathtt{0x01} \,\|\, \mathrm{MTH}(D_{0:k}) \,\|\, \mathrm{MTH}(D_{k:n})\right), \quad k = \text{largest power of 2} < n$$
 
-Every input is a value **both participants hold identically**: the sender's *user id*
-rather than a viewer-relative "in/out", and the *server's* message id and timestamp rather
-than a local clock. That is the whole point — the two devices compute the same digest, so
-comparing them is a real check. (An earlier version hashed `out` on the sender's device and
-`in` on the recipient's, which meant the two digests could never agree.) Only messages the
-server has acknowledged, that are not deleted, and that decrypted are chained.
+with $\mathrm{MTH}$ of one leaf being that leaf, and of the empty tree $\mathrm{SHA\text{-}256}(\varepsilon)$.
 
-#### Execution Snippet
+- **Domain separation.** The `0x00` / `0x01` prefixes mean an internal node can never be
+  passed off as a leaf whose data happens to be two concatenated hashes (a second-preimage
+  attack on the tree).
+- **No duplicated odd node.** A lone node at the end of a level is promoted unchanged.
+  Bitcoin instead paired it with a copy of itself, so `[a, b, c]` and `[a, b, c, c]` had the
+  same root (CVE-2012-2459). The test suite checks for exactly this.
+
+**What a leaf commits to.**
+
+$$\mathrm{record}_i = \mathrm{JSON}\left[\texttt{"qchat.leaf.v1"},\ \mathrm{sender}_i,\ \mathrm{id}_i,\ t_i,\ \mathrm{SHA\text{-}256}(\mathrm{canonical}(\mathrm{payload}_i))\right]$$
+
+The payload is the *ciphertext* envelope (canonical JSON, keys sorted), so the server can
+compute and serve every leaf without reading a message, and the tree covers the **whole
+conversation**, not just the page on screen. A deleted message's last field becomes
+`"deleted"`, which every party computes identically, so a delete reads as a delete rather
+than as tampering. Leaves are ordered by $(t_i, \mathrm{id}_i)$.
+
+The timestamp is in the leaf on purpose: AES-GCM authenticates the payload, **not** the
+time the server says it was sent. Rewriting a timestamp leaves the message perfectly
+decryptable; only the tree notices.
+
+#### 4.2 Verification on each device
+
+When a chat opens, `useTranscriptTree`:
+
+1. fetches every leaf (`GET /api/messages/:peer/leaves`, 32 bytes a message);
+2. **recomputes the leaf of every loaded message itself** and flags any message whose leaf
+   disagrees with the server's list;
+3. rebuilds the root and compares the history against the **checkpoint** this browser
+   saved last time (IndexedDB). Because each message is its own leaf, the difference is
+   named: *modified*, *removed*, *inserted into already-verified history* (back-dated), or
+   *deleted by its sender*;
+4. saves a new checkpoint while nothing is wrong. While something is, it keeps the old one,
+   so the warning survives a reload until the user explicitly accepts the current history.
+
+#### 4.3 Inclusion proofs and peer comparison
+
 ```javascript
-export async function calculateIntegrity(entries) {   // [{ from, id, timestamp, text }]
-  if (!Array.isArray(entries) || entries.length === 0) return null;
-
-  const ordered = entries
-    .map(e => ({ ...e, time: new Date(e.timestamp).toISOString() }))
-    .sort((a, b) => (a.time === b.time
-      ? (String(a.id) < String(b.id) ? -1 : 1)
-      : (a.time < b.time ? -1 : 1)));
-
-  const encoder = new TextEncoder();
-  let current = new Uint8Array(32);                    // H_0
-  for (const e of ordered) {
-    const record = encoder.encode(JSON.stringify([String(e.from), String(e.id), e.time, String(e.text ?? '')]));
-    const combined = new Uint8Array(current.length + record.length);
-    combined.set(current);
-    combined.set(record, current.length);
-    current = new Uint8Array(await crypto.subtle.digest('SHA-256', combined));   // H_n
+// merkle.js — an audit path is the sibling at each level, bottom up
+export function inclusionProof(tree, index) {
+  const path = [];
+  let i = index;
+  for (let level = 0; level < tree.levels.length - 1; level++) {
+    const row = tree.levels[level];
+    if (i % 2 === 1) path.push({ side: 'left', hash: toHex(row[i - 1]) });
+    else if (i + 1 < row.length) path.push({ side: 'right', hash: toHex(row[i + 1]) });
+    i = Math.floor(i / 2);
   }
-  return [...current].map(b => b.toString(16).padStart(2, '0')).join('');
+  return path;
 }
 ```
 
-**What it detects.** Editing a stored message's ciphertext is already caught by AES-GCM —
-it simply fails to open. The chain adds what GCM cannot see: a server that **drops,
-reorders or substitutes** messages in one party's view. Compare the header digest on both
-devices; with the same messages loaded they are identical, and any difference means the
-two transcripts are not the same.
+The **Verify** action on any message opens its proof: the leaf, each sibling hash with its
+side, and the root — re-checked with the independent algorithm of RFC 9162 §2.1.3.2,
+which takes no side hints. Proving one message in a 1,000-message conversation takes 10
+hashes, not the other 999 messages. That is what a tree gives that a hash chain cannot.
 
-> **Note:** this is a linear hash chain, not yet a branching Merkle tree. The chain says
-> *that* history differs, not *which* message — locating it means replaying the chain. A
-> Merkle tree would give per-message inclusion proofs; that upgrade is `FEAT-3`. The digest
-> also covers the messages currently loaded, so compare with the same history paged in.
+**Compare with peer** sends the local `(size, root)` to the other participant, sealed with
+ML-KEM like any signal; their device answers with its own root over the same prefix. A
+match means both devices are looking at the same history; a mismatch means the server has
+shown the two of them different conversations.
 
+#### 4.4 Demonstrating it
+
+```bash
+# open the chat on a device first (that saves a checkpoint), then:
+node scripts/tamper.js <messageId> time      # shift its timestamp 10 minutes
+node scripts/tamper.js <messageId> payload   # flip one ciphertext byte
+node scripts/tamper.js <messageId> remove    # delete the row
+```
+
+The script recomputes the server's leaf afterwards, as a careful attacker would. After a
+reload the header turns red, *History changed*, and the panel names the message: e.g.
+"Message #2 was changed after this device verified it" — while that message still decrypts
+and reads normally, because only its timestamp moved.
+
+> **Scope:** the tree proves history was not rewritten *after* a device verified it. It
+> does not prove who wrote a message (that needs signatures — see §9), and a checkpoint is
+> per-browser, so a brand-new device starts from the history it is first shown.
 
 ## 5. Secure Real-Time Communication (WebRTC Video Calling)
 *File: `frontend/src/components/ChatDashboard.jsx`*
@@ -605,7 +644,7 @@ that actually implement it.
 |---|---|---|---|
 | **Client Layer** | User interface: messaging, file sharing, video, displaying decrypted content | `frontend/src/components/` — `ChatDashboard.jsx`, `Landing.jsx`, `Login.jsx`, `Register.jsx` | Implemented |
 | **Security Layer** | ML-KEM key exchange, AES-256 symmetric encryption/decryption | `frontend/src/crypto/encryption.js` | Implemented |
-| **Integrity Layer** | Hash-linked chat history, tamper detection | `encryption.js → calculateIntegrity` | Partial — chain, not tree |
+| **Integrity Layer** | Hash-linked chat history, tamper detection | `merkle.js`, `useTranscriptTree.js`, `utils/merkleLeaf.js` | Met — RFC 6962 Merkle tree with inclusion proofs |
 | **AI Layer** | On-device phishing analysis | — | **Not implemented** |
 | **Communication Layer** | WebRTC peer-to-peer transport, PQ-protected signaling | `ChatDashboard.jsx`, `crypto/mediaTransport.js`, `crypto/mediaCrypto.js`, `backend/server.js` | Implemented, media included |
 
@@ -620,7 +659,7 @@ ciphertext; it never receives a message key or plaintext.
 | **Hybrid Encryption Module** | `encryptForRecipients` / `decryptEnvelope` — ML-KEM-768 + AES-256-GCM, HKDF-SHA256 key derivation | Implemented (§2.5) |
 | **Messaging Module** | Text, images, voice notes, files; replies, reactions, delete-for-everyone, read receipts, presence, paged history | Implemented (§6) |
 | **Video Calling Module** | WebRTC peer-to-peer audio/video, encrypted signaling, PQ-sealed media frames | Implemented (§5) |
-| **Integrity Module** | Rolling SHA-256 chain over the conversation, surfaced as a digest in the chat header | Partial (§4) |
+| **Integrity Module** | Merkle tree over every message, per-device checkpoints, inclusion proofs, peer root comparison | Implemented (§4) |
 | **Phishing Detection Module** | — | **Not implemented** |
 
 ### 8.3 Functional requirements (report §3.2.1)
@@ -630,7 +669,7 @@ ciphertext; it never receives a message key or plaintext.
 | Secure key exchange using ML-KEM | Met | ML-KEM-768, 1184-byte public key, 1088-byte ciphertext |
 | Message encryption using AES-256 | Met | AES-256-GCM, 12-byte IV, 16-byte authentication tag |
 | End-to-end decryption at receiver only | Met | Private key never leaves the device in plaintext; the server stores only a password-encrypted backup it cannot open |
-| Integrity verification using Merkle Tree | Partial | Hash chain detects modification; no per-message inclusion proof |
+| Integrity verification using Merkle Tree | Met | RFC 6962 tree; modification, removal and back-dating are detected and named; O(log n) inclusion proofs |
 | AI-based phishing detection | **Not met** | No model present |
 | Secure real-time communication (WebRTC) | Met | Signaling and media both PQ-protected |
 | Authentication and access control | Met | JWT on REST and sockets; every socket event derives its actor from the verified token |
@@ -660,7 +699,7 @@ Stating this plainly matters more than any feature list.
 | **The server operator reading messages** | The server stores ciphertext and wrapped keys only. It never holds a content key. |
 | **The server operator reading reactions** | Reaction emoji sets are encrypted to both parties; the server upserts blindly by user id. |
 | **A stolen database** | Private-key backups are AES-256-GCM sealed under PBKDF2-SHA256 (600,000 iterations) of the user's password. |
-| **Tampering with a stored message** | AES-GCM authentication tags fail on any modification. Dropping or reordering messages in one party's view makes the two devices' integrity digests disagree. |
+| **Tampering with a stored message** | AES-GCM authentication tags fail on any modification of the ciphertext. The Merkle tree catches what GCM cannot — a rewritten timestamp, a removed message, a back-dated insert — names the message, and a one-click root comparison exposes a server showing the two participants different histories. |
 | **Another user impersonating you over the socket** | The actor is derived from the handshake-verified JWT, never from the event body. |
 | **Another user interfering with a call** | Signals are accepted only from the pinned call peer, and the relay only forwards signals between related accounts. |
 | **Script injection via attachments** | Attachment URLs are rendered only as base64 `data:` URLs of the expected type; `javascript:` and anything else is shown as blocked. |
@@ -724,7 +763,13 @@ The frontend needs no configuration for local dev (an empty `VITE_API_URL` route
 `/api` through the Vite proxy). For a deployment, or to enable TURN, copy
 `frontend/.env.example` to `frontend/.env.local`.
 
-### 10.4 Run Development Servers
+### 10.4 Tests
+```bash
+cd frontend && npm test   # Merkle tree: CT test vectors, RFC 6962 reference, every proof up to 64 leaves
+cd backend  && npm test   # server and browser compute byte-identical leaves
+```
+
+### 10.5 Run Development Servers
 ```bash
 # Terminal 1: Backend
 cd backend
@@ -746,7 +791,7 @@ next phase has a concrete starting point.
 
 | Report claim | Reality | Tracked as |
 |---|---|---|
-| "SHA-256 based Merkle hash chain… detection of unauthorized modification" (Abstract) | Implemented and working as a hash chain — tamper detection holds. Chapters 3 and 5 additionally describe *hierarchical* linking; the branching tree and its inclusion proofs are `FEAT-3`. | `FEAT-3` |
+| "SHA-256 based Merkle hash chain… detection of unauthorized modification" (Abstract) | Met. An RFC 6962 Merkle tree over every message, with per-device checkpoints, named findings, inclusion proofs and peer comparison (§4). | — |
 | "On-device AI-based phishing detection module using TensorFlow.js" (Abstract) | Phase II. The AI Layer is reserved in the architecture; no model is trained or loaded yet. | `FEAT-2` |
 | "Extensive testing demonstrates… effectively detects phishing attempts" (Abstract) | Reword before final submission — the detection module is Phase II scope. | `FEAT-2` |
 | "Scalability: handles multiple concurrent users without performance degradation" (§3.2.2) | Architecturally plausible, never measured. No load test exists. | `OPS-1` |
@@ -759,15 +804,18 @@ next phase has a concrete starting point.
 **Verified working:** post-quantum call media has been confirmed in a live two-party
 call on Chrome, and the whole stack has been driven end-to-end in two headless Chromium
 sessions against a real MongoDB: registration and key recovery on a new device, matching
-integrity digests, the attachment-URL guard, presence and relay scoping, decline /
+Merkle roots and inclusion proofs, detection of a rewritten timestamp and a removed message, the attachment-URL guard, presence and relay scoping, decline /
 spoofed hang-up / chat-lock during calls, sealed and negotiated-fallback media, concurrent
 reactions, tie-safe paging, uniform login errors and logout cleanup. The Firefox/Safari
 code path is implemented but has not been exercised.
 
-Cryptographic correctness has been verified by direct exercise of the primitives —
-round-trip encryption in both directions, rejection of tampered ciphertext and headers,
-key-separation between directions, and rejection of foreign keys. Formalising these into a
-committed regression suite is planned.
+The Merkle tree has a committed test suite (§10.4): the Certificate Transparency
+reference vectors, agreement with a literal RFC 6962 implementation for 0–100 leaves,
+every inclusion proof for every tree up to 64 leaves, rejection of altered proofs, the
+CVE-2012-2459 case, and byte-identical leaves between server and browser. The tamper
+scenarios of §4.4 were also driven end-to-end in two browsers. The message and media
+ciphers were verified by direct exercise of the primitives; committing those as a suite
+is still to do.
 
 ---
 
@@ -780,15 +828,22 @@ backend/
   db/database.js       User and Message schemas, index definitions
   middleware/auth.js   REST token check + Socket.io handshake auth
   routes/              auth.js · messages.js · users.js
-  utils/               qchatId.js · validation.js · logger.js
+  utils/               qchatId.js · validation.js · logger.js · serialize.js · merkleLeaf.js
+  scripts/             delete-user.js · tamper.js (Merkle demo)
+  test/                merkleLeaf.test.js
 frontend/src/
   components/          ChatDashboard · Landing · Login · Register · visuals/
   crypto/
-    encryption.js          ML-KEM + AES message crypto, key backup, integrity chain
+    encryption.js          ML-KEM + AES message crypto, key backup, key identity
+    merkle.js              RFC 6962 Merkle tree, inclusion proofs, checkpoint comparison
+    merkle.test.js         node --test suite for the tree
     mediaCrypto.js         Per-frame cipher for call media
     mediaTransport.js      Binds the frame cipher to an RTCPeerConnection
     mediaTransform.worker.js  Firefox/Safari encoded-transform path
+  hooks/useTranscriptTree.js  Builds, verifies and checkpoints the open chat's tree
+  components/TranscriptPanel.jsx  Header badge, integrity panel, proof dialog
   lib/api.js           axios instance with auth + 401 handling
+  lib/checkpointStore.js  IndexedDB store for per-device tree checkpoints
 CLAUDE.md              Full codebase index — file map, crypto contracts, gotchas
 improve.txt            Live backlog (gitignored)
 ```
