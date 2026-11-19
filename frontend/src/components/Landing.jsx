@@ -60,26 +60,26 @@ const PIPELINE = [
 const FEATURES = [
   { icon: MessageSquare, title: 'Real-time messaging', body: 'Delivery and read receipts, typing indicators, replies, reactions and delete-for-everyone — all of it encrypted end to end.' },
   { icon: Paperclip,     title: 'Files and voice notes', body: 'Images, documents and recorded audio travel through the same pipeline as text. Filenames are encrypted too.' },
-  { icon: Video,         title: 'Peer-to-peer video calls', body: 'Media flows directly between devices over WebRTC. Every SDP offer, answer and ICE candidate is post-quantum encrypted before touching the relay; the media itself rides on DTLS-SRTP.' },
+  { icon: Video,         title: 'Peer-to-peer video calls', body: 'Media flows directly between devices over WebRTC. Signalling is post-quantum encrypted, and every audio and video frame is sealed with AES-256-GCM under a key agreed through ML-KEM — not only WebRTC\'s classical DTLS-SRTP.' },
   { icon: UserPlus,      title: 'Private by default',  body: 'No public directory. You are found only by a shareable QChat ID such as QC-8L99-2TVY, matched exactly — so the user base cannot be enumerated or probed for a username.' },
-  { icon: Fingerprint,   title: 'Tamper-evident history', body: 'Every message folds into a rolling SHA-256 chain — previous hash, text, timestamp and direction — so a conversation carries a fingerprint that shifts if any earlier message is altered.' },
+  { icon: Fingerprint,   title: 'Tamper-evident history', body: 'Every conversation is a Merkle tree. Your device remembers what it verified, names any message that was later changed, removed or back-dated, and can prove a single message belongs with a handful of hashes.' },
   { icon: ShieldCheck,   title: 'Hardened by default', body: 'Both the REST API and the socket layer authenticate independently, with rate limiting and strict input validation.' },
 ];
 
 const SPEC = [
   ['Key encapsulation', 'ML-KEM-768 (NIST FIPS 203)'],
   ['Public key', '1184 bytes'],
-  ['Secret key', '2400 bytes · never leaves the device'],
+  ['Secret key', '2400 bytes · leaves the device only password-encrypted'],
   ['KEM ciphertext', '1088 bytes'],
   ['Shared secret', '32 bytes'],
   ['Key derivation', 'HKDF-SHA256 · random salt + context string'],
   ['Content cipher', 'AES-256-GCM · 12-byte nonce · 16-byte tag'],
   ['Integrity', 'SHA-256 Merkle tree (RFC 6962)'],
   ['Messaging transport', 'Socket.io · JWT-authenticated handshake'],
-  ['Call media', 'WebRTC · DTLS-SRTP, signalling post-quantum encrypted'],
+  ['Call media', 'WebRTC · each frame AES-256-GCM under an ML-KEM key'],
 ];
 
-const SERVER_BLIND = ['Message text', 'Photos, files and voice notes', 'Attachment filenames', 'Emoji reactions', 'Call signalling', 'Your private key'];
+const SERVER_BLIND = ['Message text', 'Photos, files and voice notes', 'Attachment filenames', 'Emoji reactions', 'Call signalling', 'Call audio and video', 'Your private key'];
 const SERVER_SEES  = ['Who messages whom', 'When messages are sent', 'Whether a message is text or media', 'Delivery and read state', 'Online and last-seen status'];
 
 const NAV_LINKS = [

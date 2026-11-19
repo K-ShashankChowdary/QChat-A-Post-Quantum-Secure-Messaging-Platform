@@ -261,8 +261,13 @@ Pre-v2 plaintext reactions (`emoji` field) still render.
   per socket. `send_message` is *not* gated (a first message is a feature) but rejects self
   and nonexistent recipients.
 - **Login.** One error for unknown user and wrong password, with a dummy bcrypt compare so
-  timing matches; per-username lock after 5 failures / 15 min (in-memory map) on top of the
-  per-IP limiter.
+  timing matches. Failure counters (in-memory, 15 min): 5 per (username, IP), 50 per username
+  from anywhere. Username-only locking would let anyone lock a victim out.
+- **Delivery race.** `send_message` re-checks `isUserOnline` *after* saving: a recipient who
+  connected mid-save ran their offline flush before the message existed.
+- **Read receipts** go to the actual senders of the updated messages, not the client-named
+  `toId`.
+- **`.env`** is loaded relative to `config/env.js`, so scripts run from any directory.
 - **`GET /api/health`** → `{ ok, db }`. SIGINT/SIGTERM close sockets and Mongo cleanly.
 - **Offline queue.** `deliverPendingMessages` flushes `delivered: false` messages on connect,
   then notifies each original sender via `message_delivered`.
@@ -393,6 +398,9 @@ version went green on presence alone and lied for two whole test calls.
 - **Unread + first contact.** `noteBackgroundMessage` bumps `u.unread`, or calls `fetchUsers()`
   if the sender isn't in the list yet. `fetchUsers` writes `usersRef` synchronously so an
   awaiting caller (`findContact`) sees the fresh list.
+- **Failed sends** carry `sendFailed`, not `error`. `error` means undecryptable and is folded
+  into the "encrypted to an earlier key" row — where a failed send used to disappear. The
+  bubble shows *Not sent · Retry · Discard*; retry re-emits the sealed payload it kept.
 - `logout` hangs up, closes the socket and calls `clearSession()` (which also clears the
   remembered chat). A failed sign-in also `clearSession()`s — the token used to survive a
   failed key recovery. Login derives the public key from the stored private key (FIPS 203

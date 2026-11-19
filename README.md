@@ -429,16 +429,23 @@ shown the two of them different conversations.
 
 #### 4.4 Demonstrating it
 
+1. Start the app and exchange a few messages between two accounts. Open the chat on both
+   devices — that saves each device's checkpoint.
+2. In a terminal (MongoDB running, `backend/.env` in place):
+
 ```bash
-# open the chat on a device first (that saves a checkpoint), then:
-node scripts/tamper.js <messageId> time      # shift its timestamp 10 minutes
-node scripts/tamper.js <messageId> payload   # flip one ciphertext byte
-node scripts/tamper.js <messageId> remove    # delete the row
+cd backend
+node scripts/tamper.js list <userA> <userB>    # the conversation, numbered in tree order, with ids
+node scripts/tamper.js <messageId> time        # shift that message's timestamp by 10 minutes
+node scripts/tamper.js <messageId> payload     # or: flip one byte of its ciphertext
+node scripts/tamper.js <messageId> remove      # or: delete the row
 ```
 
+3. Reload the chat.
+
 The script recomputes the server's leaf afterwards, as a careful attacker would. After a
-reload the header turns red, *History changed*, and the panel names the message: e.g.
-"Message #2 was changed after this device verified it" — while that message still decrypts
+reload the header turns red, *History changed*, and the panel names the message by the same
+number `list` printed: e.g. "Message #2 was changed after this device verified it" — while that message still decrypts
 and reads normally, because only its timestamp moved.
 
 > **Scope:** the tree proves history was not rewritten *after* a device verified it. It
@@ -704,7 +711,7 @@ Stating this plainly matters more than any feature list.
 | **Another user interfering with a call** | Signals are accepted only from the pinned call peer, and the relay only forwards signals between related accounts. |
 | **Script injection via attachments** | Attachment URLs are rendered only as base64 `data:` URLs of the expected type; `javascript:` and anything else is shown as blocked. |
 | **Account enumeration** | Contact lookup is exact-match on a random ~1.1e12-space id, separately rate-limited. Sign-in gives one answer for an unknown username and a wrong password, at equal bcrypt cost. |
-| **Password guessing** | Per-IP rate limit on auth, plus a per-account lock after 5 failures in 15 minutes. |
+| **Password guessing** | Per-IP rate limit on auth; 5 failures for one account from one address lock that address out for 15 minutes, and 50 from anywhere cap the account — without letting a stranger lock a victim out with five bad guesses. |
 | **Presence snooping** | Online/last-seen updates go only to related accounts. |
 
 ### Explicitly NOT protected against
