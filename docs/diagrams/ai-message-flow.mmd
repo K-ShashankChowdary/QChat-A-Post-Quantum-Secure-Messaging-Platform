@@ -1,0 +1,12 @@
+flowchart LR
+  A[User types message] --> B{AI shield<br/>Web Worker}
+  B -- clean --> C[ML-KEM-768 + AES-256-GCM<br/>encrypt]
+  B -- flagged --> D[Security alert:<br/>Edit message / Send anyway]
+  D -- Send anyway --> C
+  D -- Edit --> A
+  C --> E[Server stores ciphertext<br/>+ Merkle leaf]
+  E --> F[Recipient decrypts]
+  F --> G{AI shield}
+  G -- phishing --> H[Red warning banner<br/>with the reasons]
+  G -- abuse --> I[Message blurred,<br/>Show on demand]
+  G -- clean --> J[Shown normally]

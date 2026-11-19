@@ -5,7 +5,8 @@ Repo: `K-ShashankChowdary/QChat-A-Post-Quantum-Secure-Messaging-Platform`.
 
 **Stack.** React 18.3 + Vite 5.3 + Tailwind 3.4 + framer-motion 11 · Express 4.19 +
 Socket.io 4.7 + Mongoose 8.4 · `@noble/post-quantum` 0.6.1 (`ml_kem768`) + WebCrypto
-(AES-GCM, HKDF, PBKDF2, SHA-256) · bcrypt, jsonwebtoken, helmet, express-rate-limit, morgan.
+(AES-GCM, HKDF, PBKDF2, SHA-256) · bcrypt, jsonwebtoken, helmet, express-rate-limit, morgan ·
+`@tensorflow/tfjs` 4.22 + `@xenova/transformers` 2.17 (on-device AI).
 ESM throughout (`"type": "module"` both sides). Node 20+.
 
 ~2,900 lines of own source. `ChatDashboard.jsx` alone is ~2,100 of them.
@@ -18,11 +19,12 @@ ESM throughout (`"type": "module"` both sides). Node 20+.
 |---|---|---|
 | 1 | Hybrid ML-KEM + AES-256 for messages and key exchange | **done** |
 | 2 | Merkle tree so chat records are tamper-proof | **done** — RFC 6962 Merkle tree with checkpoints, named findings, inclusion proofs and peer root comparison (§4 below) |
-| 3 | On-device AI phishing detection, no server exposure | **not started** (`FEAT-2`) |
+| 3 | On-device AI phishing detection, no server exposure | **done** (Nov 2026) — TF.js phishing classifier + Transformers.js toxic-bert in a Web Worker; outgoing check before encryption, incoming banner/blur (§2 "On-device AI shield") |
+| 5 | Scalable, modular architecture | **done, measured** — `backend/scripts/loadtest.js`: 250 users 0 loss p50 3.7 ms; 500 users 0 loss but p95 ≈ 500 ms (one process saturated). README §7 |
 | 4 | WebRTC video with PQ protection on signalling **and** media | **done** (`7e71230`), verified Chrome↔Chrome |
 
-Objectives 2 and 3 were explicitly parked. Say this plainly rather than letting the
-README's phrasing imply otherwise.
+All five objectives now have code behind them. State the AI and load-test numbers as
+measured (README §6–§7), including their limits — don't round them up.
 
 ---
 
@@ -48,6 +50,7 @@ README's phrasing imply otherwise.
 | `routes/demo.js` | In-app attack simulator. 404 unless `DEMO_MODE=true`, refused in production; participants only; undo via `/restore`; emits `transcript_refresh` to both sides. |
 | `test/merkleLeaf.test.js` | `npm test` — server and browser leaves must be identical. |
 | `scripts/delete-user.js` (49) | Deletes an account + its messages + contact refs. |
+| `scripts/loadtest.js` | Objective-5 load test: N paired sockets, v2-sized payloads, end-to-end latency percentiles. |
 
 ### Frontend (`frontend/src/`, ~2,100 lines)
 | File | Role |
@@ -68,6 +71,35 @@ README's phrasing imply otherwise.
 | `components/visuals/Toast.jsx` (151) | `ToastProvider` / `useToast()` → `{success, error, info, confirm}`. |
 | `components/visuals/LatticeField.jsx` (187) | Animated lattice canvas, used as backdrop everywhere. |
 | `App.jsx` | Routes: `/` Landing · `/login` · `/register` · `/chat` (PrivateRoute) · `*` → `/`. |
+
+### On-device AI shield (objective 3) — `frontend/src/ai/`
+
+| File | Role |
+|---|---|
+| `threat.worker.js` | Module Web Worker hosting both models. `init {base}` / `analyze {id,text}` in; `status` / `result` out. `tf.setBackend('cpu')` — no WebGL in a worker. |
+| `threatShield.js` | Main-thread API: `startShield`, `analyzeMessage(text, timeoutMs)` (resolves `null` on timeout — never blocks a send), `onShieldStatus`, `describeThreat`, `shieldEnabled`/`setShieldEnabled` (localStorage `qchat_ai_shield`, try/catch). |
+| `phishingFeatures.js` | **Shared by training and inference** — word uni+bigrams (2048) + URL char-trigrams (1024) + 18 signals = 3090 dims, FNV-1a hashed. `explain()` turns fired signals into user-facing reasons. Change it ⇒ retrain. |
+| `phishing.js` | Loads `/models/phishing/` (or `{artifacts, meta}` in Node). `decide()`: flag if score ≥ threshold **and** a reason fired, or score ≥ `policy.override`. Policy comes from `meta.json`. |
+| `toxicity.js` | Transformers.js v2 (`@xenova/transformers` 2.17.2), `Xenova/toxic-bert` quantized, per-label `THRESHOLDS`. `configureTransformers({local, base})` points it at `/models/hf/` + `/models/ort/` when present. |
+| `fixtures.json`, `phishing.test.js`, `toxicity.rules.test.js`, `toxicity.model.test.js` | `npm test` runs the first three (TC-04 included); `npm run test:toxicity` runs TC-05 on the real model. |
+
+- `public/models/phishing/` (model.json, weights.bin ≈ 396 KB, meta.json with test metrics)
+  **is committed**. Regenerate with `npm run train:phishing` (dataset cached in
+  `~/.cache/qchat-datasets`, seeded). Deployed test metrics: acc 0.865, precision 0.938,
+  recall 0.757, F1 0.838, FPR 0.043 (n=7402). threshold 0.55, override 0.90.
+- `public/models/hf/` and `public/models/ort/` are **gitignored**; `npm run fetch-models`
+  fills them. The worker detects them via `hf/manifest.json` (a Vite dev server answers a
+  missing file with index.html, so a plain fetch can't tell). Without them the browser
+  pulls toxic-bert from huggingface.co and the ORT wasm from jsDelivr — verified both ways.
+- `ChatDashboard.jsx`: outgoing check runs **before** `setInput('')`/encryption with a 1.5 s
+  cap → `toast.confirm` (*Edit message* / *Send anyway*). Incoming text is scanned once per
+  message id (`scannedRef`), re-scanned when a model finishes loading. Phishing → banner with
+  reasons; abuse → blurred with Show/Hide (`revealed`). Sidebar card shows status + switch.
+- `describeThreat` drops a reason-less phishing flag when toxicity also flags — abuse
+  otherwise double-labelled as phishing (spam-trained model).
+- Benchmarks: `npm run bench [-- --toxicity]` (frontend). Load test:
+  `node backend/scripts/loadtest.js --users N --messages M --rate R` (creates accounts
+  directly in Mongo, signs JWTs, cleans up unless `--keep`). Figures are in README §7.
 
 ---
 
@@ -454,9 +486,15 @@ committed** — don't cite it as repo-verifiable.
 
 **Still worth knowing:** the slide deck (`Major_Project_Presentation.pptx`) names **Redis and
 Docker** in its tech stack; neither appears in any dependency list. The README never did, so
-this is a slides-only correction. The only committed tests are the Merkle suites (`npm test` in
-frontend and backend); the 13 media-cipher tests were run ad hoc, so do not cite them as
+this is a slides-only correction (it also says Material UI; the UI is Tailwind). The report
+text says "Merkle hash chain"; the code is a full RFC 6962 tree. Committed tests: the Merkle
+suites (`npm test` in frontend and backend) and the AI tests (`npm test`, `npm run
+test:toxicity` in frontend); the 13 media-cipher tests were run ad hoc, so do not cite them as
 repo-verifiable.
+
+**Nov 2026 objectives pass:** README gained §6 (AI shield) and §7 (benchmarks + load test),
+§10.0 Mermaid diagrams (also in `docs/diagrams/` as .mmd + .png), and sections 6–12 were
+renumbered to 8–14.
 
 ## 11. Gotchas that already cost real time
 
@@ -489,13 +527,12 @@ repo-verifiable.
 
 ## 12. Open backlog (`improve.txt`)
 
-- **OPS-1** — load-test the WebSocket handshake. Open. Its premise still claims every message
-  is encrypted twice; v2 fixed that, so rewrite the ticket before measuring anything.
+- ~~**OPS-1** — load test.~~ Done (Nov 2026): `backend/scripts/loadtest.js`, results in README §7.2. Next step if needed: Socket.io Redis adapter + multiple processes.
 - **OPS-3** — TURN relay. ICE config is env-driven (`VITE_TURN_*`) but no relay is
   provisioned, so **calls only work on a single LAN**. Do this before demoing.
 - **OPS-4** — attachments are base64, inline in the `Message` document. Blob storage with a
   reference + key material in the payload would roughly halve storage and bandwidth.
-- **FEAT-2** — on-device AI phishing detection. Objective 3. No code exists.
+- ~~**FEAT-2** — on-device AI phishing detection.~~ Done (Nov 2026): `frontend/src/ai/`, README §6.
 - ~~**FEAT-3** — true branching Merkle tree.~~ Done (Nov 2026): RFC 6962 tree, checkpoints, proofs, peer compare.
 - **(unticketed)** ML-DSA signatures on every payload — closes the forged-sender gap.
 - **(unticketed)** commit the e2e suite as a real regression test.

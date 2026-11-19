@@ -1,0 +1,12 @@
+sequenceDiagram
+  participant A as Caller
+  participant S as Server (relay)
+  participant B as Callee
+  A->>A: Random 32-byte media secret
+  A->>S: call offer: SDP + media secret, sealed to the callee (ML-KEM-768 + AES-GCM)
+  S->>B: relay sealed offer (server cannot open it)
+  B->>B: Decapsulate, recover the media secret
+  B->>S: sealed answer
+  S->>A: relay sealed answer
+  A-->>B: sealed ICE candidates, then direct WebRTC
+  Note over A,B: HKDF derives one AES-256-GCM key per direction.<br/>Every encoded audio/video frame is sealed, on top of DTLS-SRTP

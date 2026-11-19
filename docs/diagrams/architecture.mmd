@@ -1,0 +1,25 @@
+flowchart TB
+  subgraph Browser["Client device (browser)"]
+    UI["Client Layer<br/>React UI: chat, files, voice notes, video"]
+    AI["AI Layer (Web Worker)<br/>TF.js phishing model · toxic-bert"]
+    SEC["Security Layer<br/>ML-KEM-768 · HKDF-SHA256 · AES-256-GCM"]
+    INT["Integrity Layer<br/>RFC 6962 Merkle tree · IndexedDB checkpoints"]
+    COM["Communication Layer<br/>Socket.io client · WebRTC + per-frame sealing"]
+    UI --> AI
+    UI --> SEC
+    SEC --> COM
+    INT --- UI
+  end
+  subgraph Server["Node.js server (sees ciphertext only)"]
+    API["Express REST<br/>JWT · bcrypt · rate limits"]
+    WS["Socket.io relay<br/>messages · presence · call signals"]
+    LEAF["Merkle leaf service"]
+  end
+  DB[("MongoDB<br/>users · public keys · ciphertext")]
+  COM -- "HTTPS / WSS" --> API
+  COM -- "WSS" --> WS
+  COM <-. "WebRTC P2P media, PQ-sealed frames" .-> PEER["Peer's browser"]
+  API --> DB
+  WS --> DB
+  LEAF --> DB
+  INT -- "leaves + proofs" --> LEAF

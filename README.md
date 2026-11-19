@@ -20,13 +20,15 @@ so that it holds only ciphertext it cannot open.
 3. [Real-time network and synchronization](#3-real-time-network--synchronization-logic)
 4. [Merkle-tree transcript integrity](#4-merkle-tree-transcript-integrity)
 5. [Secure real-time communication (WebRTC)](#5-secure-real-time-communication-webrtc-video-calling)
-6. [Messaging features](#6-messaging-features-attachments-replies-reactions-delete-presence)
-7. [Identity, contacts and access control](#7-identity-contacts--access-control)
-8. [System architecture, modules and requirements](#8-system-architecture-modules-and-requirements)
-9. [Threat model — what this does and does not protect](#9-threat-model--what-this-does-and-does-not-protect)
-10. [Setup and installation](#10-setup--installation)
-11. [Gaps against the report](#11-gaps-against-the-report)
-
+6. [On-device AI shield](#6-on-device-ai-shield-objective-3)
+7. [Performance and scalability](#7-performance-and-scalability-objective-5-report-table-52)
+8. [Messaging features](#8-messaging-features-attachments-replies-reactions-delete-presence)
+9. [Identity, contacts and access control](#9-identity-contacts--access-control)
+10. [System architecture, modules and requirements](#10-system-architecture-modules-and-requirements)
+11. [Threat model — what this does and does not protect](#11-threat-model--what-this-does-and-does-not-protect)
+12. [Setup and installation](#12-setup--installation)
+13. [Current limitations and future scope](#13-current-limitations-and-future-scope)
+14. [Repository layout](#14-repository-layout)
 ---
 
 ## 1. Objectives and Status
@@ -37,13 +39,13 @@ The five objectives from Chapter 1.2 of the report, mapped to the delivered syst
 |---|---|---|
 | 1 | Hybrid encryption framework combining **ML-KEM** with **AES-256** for secure key exchange and message confidentiality | ✅ **Delivered.** ML-KEM-768 encapsulation per recipient, AES-256-GCM over the content, HKDF-SHA256 key derivation. Payload v2 encrypts once and wraps the content key per party — a measured **49.9%** reduction in stored bytes over the naive approach. |
 | 2 | Data integrity through a **Merkle hash chain**, detecting unauthorized modification of chat history | ✅ **Delivered.** Every conversation is an RFC 6962 **Merkle tree**: each message is a leaf hashed from its sender, id, timestamp and ciphertext, and the root is shown in the chat header. Each device checkpoints the tree and, on every visit, names any message that was **modified, removed or back-dated** since — including a rewritten timestamp, which encryption alone cannot detect. Any message can be proven a member of the history with a ⌈log₂ n⌉-hash **inclusion proof**, and the two participants can compare roots in one click. |
-| 3 | On-device **AI phishing detection**, preserving privacy by keeping analysis local | 🔜 **Phase II.** The architecture reserves the AI Layer and the client-side inference boundary it requires; the model itself is future scope, consistent with report §5.2. |
+| 3 | On-device **AI phishing detection**, preserving privacy by keeping analysis local | ✅ **Delivered.** Two models run in a browser Web Worker: a TensorFlow.js phishing classifier trained for this project (93.8% precision, 4.3% false alarms on 7,402 held-out samples, 0.5 ms per message) and the Transformers.js `toxic-bert` hate-speech model. Outgoing drafts are checked *before encryption* and stopped with an explanation; incoming phishing is bannered and abuse blurred. No text ever leaves the device (§6). |
 | 4 | Secure real-time **WebRTC** video calling with post-quantum protection of **signaling and media** | ✅ **Delivered, and extended.** Signaling is ML-KEM sealed, and *every encoded media frame* is additionally sealed with AES-256-GCM under an ML-KEM-derived key — so the audio and video are protected by post-quantum cryptography, not only by WebRTC's classical DTLS-SRTP. Verified in live two-party calls. |
-| 5 | **Scalable and modular architecture** supporting future enhancement | ✅ **Delivered.** Clean layer and module separation (§8), env-driven configuration, stateless JWT auth, room-based socket fan-out and cursor-paged history — all of which scale horizontally. Formal load characterisation is scheduled as `OPS-1`. |
+| 5 | **Scalable and modular architecture** supporting future enhancement | ✅ **Delivered and measured.** Clean layer and module separation (§10), env-driven configuration, stateless JWT auth, room-based socket fan-out and cursor-paged history. Load-tested: **250 concurrent users, 5,000 messages, 0 lost, 3.7 ms median delivery** on a single process; at 500 users still 0 lost, with latency rising as that one process saturates (§7). |
 
-**Four of five objectives are delivered**, including the full post-quantum media path
-that the report lists only as a target and a Merkle tree with inclusion proofs. On-device
-AI detection is deliberately sequenced into Phase II.
+**All five objectives are delivered**, including the full post-quantum media path
+that the report lists only as a target, a Merkle tree with inclusion proofs, and on-device
+AI detection with measured accuracy. Section 13 lists what remains future scope.
 
 ---
 
@@ -473,7 +475,7 @@ node scripts/tamper.js <messageId> time        # or: payload | remove | insert
 Reload the chat afterwards. (The terminal route has no undo.)
 
 > **Scope:** the tree proves history was not rewritten *after* a device verified it. It
-> does not prove who wrote a message (that needs signatures — see §9), and a checkpoint is
+> does not prove who wrote a message (that needs signatures — see §11), and a checkpoint is
 > per-browser, so a brand-new device starts from the history it is first shown.
 
 ## 5. Secure Real-Time Communication (WebRTC Video Calling)
@@ -594,7 +596,163 @@ proves nothing about whether the peer can read what was sent.
 > both ways, both badges amber). The Firefox/Safari worker path is implemented but has
 > not been exercised on those browsers.
 
-## 6. Messaging Features (Attachments, Replies, Reactions, Delete, Presence)
+## 6. On-Device AI Shield (Objective 3)
+
+Objective 3 asks for phishing detection that **never exposes message content to a
+server**. End-to-end encryption makes that a hard constraint, not a preference: the
+server only ever sees ciphertext, so any analysis has to happen on the device, on the
+plaintext, before encryption (outgoing) or after decryption (incoming). QChat runs two
+models in the browser, inside a dedicated Web Worker:
+
+| Model | Detects | Technology | Size | Median inference |
+|---|---|---|---|---|
+| **QChat phishing classifier** (trained for this project) | Phishing lures, credential harvesting, look-alike links | TensorFlow.js dense network over hashed text and URL features | 396 KB, in the repo | **0.54 ms** |
+| **toxic-bert** (`Xenova/toxic-bert`, int8 ONNX) | Hate speech, threats, identity attacks, insults | Transformers.js (BERT, ONNX Runtime WebAssembly) | ~110 MB, downloaded once and cached | **10.5 ms** |
+
+### 6.1 Where it sits in the message flow (report Fig. 4.1)
+
+```mermaid
+flowchart LR
+  A[User types message] --> B{AI shield<br/>Web Worker}
+  B -- clean --> C[ML-KEM-768 + AES-256-GCM<br/>encrypt]
+  B -- flagged --> D[Security alert:<br/>Edit message / Send anyway]
+  D -- Send anyway --> C
+  D -- Edit --> A
+  C --> E[Server stores ciphertext<br/>+ Merkle leaf]
+  E --> F[Recipient decrypts]
+  F --> G{AI shield}
+  G -- phishing --> H[Red warning banner<br/>with the reasons]
+  G -- abuse --> I[Message blurred,<br/>Show on demand]
+  G -- clean --> J[Shown normally]
+```
+
+- **Outgoing:** the draft is analysed *before* it is encrypted. If either model flags it,
+  sending stops and a dialog explains why, with **Edit message** (default) or **Send anyway**.
+  The check is capped at 1.5 s so a slow device can never block a message.
+- **Incoming:** each decrypted text is analysed once. Phishing gets a red banner listing the
+  concrete reasons (e.g. *"Link to a look-alike of paypal.com"*, *"Asks for a password or OTP"*);
+  abuse is blurred behind a **Show** button. Nothing is deleted — the user stays in control.
+- **Privacy:** text goes to the worker by `postMessage` and the verdict comes back the same way.
+  The worker's only network traffic is fetching model files. Run `npm run fetch-models` and
+  QChat serves those files itself, so *no request leaves your own server at all*.
+- The shield can be switched off per browser from the sidebar; its status (loading %,
+  ready, error) is shown there too.
+
+### 6.2 The phishing model
+
+Trained in this repository by `frontend/scripts/train-phishing.mjs` (seeded, reproducible):
+
+- **Data:** [`ealvaradob/phishing-dataset`](https://huggingface.co/datasets/ealvaradob/phishing-dataset)
+  (Apache-2.0) — SMS, e-mail and URL samples, half the URLs wrapped in neutral chat sentences
+  so the model sees links the way they appear in a chat. 37,749 train / 4,985 validation /
+  7,402 test.
+- **Features (3,090):** 2,048 hashed word unigrams + bigrams, 1,024 hashed URL character
+  trigrams, and **18 hand-built signals** — IP-address hosts, URL shorteners, risky TLDs,
+  `@` in a URL, punycode, deep sub-domains, plain `http`, **brand look-alikes**
+  (`paypa1`, `amaz0n`, `sbi-kyc-update…`), credential requests, urgency, prize lures,
+  shouting. The same `phishingFeatures.js` runs in training and in the browser, so there
+  is no train/serve skew.
+- **Network:** `Dense(3090→32, ReLU) → Dropout(0.2) → Dense(32→1, sigmoid)`, Adam, L2.
+- **Decision policy:** a message in the grey zone (score ≥ 0.55 but < 0.90) is flagged only
+  if at least one concrete signal fired, so the user is always told *why*. Above 0.90 the
+  score alone is enough. The 0.90 override was chosen on the validation set as the best F1
+  with a false-alarm rate ≤ 4%.
+
+Held-out test set (n = 7,402), from `public/models/phishing/meta.json`:
+
+| | Accuracy | Precision | Recall | F1 | False-positive rate |
+|---|---|---|---|---|---|
+| Raw model (threshold 0.55) | 89.7% | 90.4% | 86.7% | 0.886 | 7.8% |
+| **As deployed** (with the policy) | **86.5%** | **93.8%** | **75.7%** | **0.838** | **4.3%** |
+| Deployed — short messages (SMS-style) | 82.2% | 93.0% | 64.4% | 0.761 | 3.8% |
+| Deployed — e-mail text | 90.6% | 93.3% | 81.5% | 0.870 | 3.7% |
+| Deployed — URLs | 85.3% | 94.1% | 75.2% | 0.836 | 4.7% |
+
+The policy deliberately trades recall for precision: in a chat app a false alarm on a
+friend's message is costly, and a warning is only useful if it says what is wrong.
+
+### 6.3 The hate-speech model
+
+`Xenova/toxic-bert` is the ONNX export of Unitary's `toxic-bert`, trained on the Jigsaw
+toxic-comment data. It returns six scores (toxic, severe_toxic, obscene, threat, insult,
+identity_hate); `toxicity.js` applies per-label thresholds tuned so that mild profanity
+between friends passes while threats, identity attacks and targeted abuse are flagged.
+It is a pretrained model; QChat does not retrain it, and no in-house accuracy figure is
+claimed for it beyond the test cases below.
+
+### 6.4 Test cases (report Table 5.1)
+
+| ID | Case | Result |
+|---|---|---|
+| TC-04 | Phishing message with a look-alike link | ✅ Flagged, ≥ 2 reasons, < 50 ms (`npm test`) |
+| TC-05 | Hate speech and threats | ✅ Insults and a threat flagged (the threat labelled *threat*); ordinary text, including "i hate mondays", passes (`npm run test:toxicity`) |
+| — | 20 ordinary chat messages / 10 phishing lures | ✅ 0 false alarms, 10 of 10 caught (test allows ≤ 1 of each) |
+| — | Browser end-to-end (two users) | ✅ Outgoing phishing and abuse intercepted; incoming phishing bannered; abuse blurred; normal text untouched; no third-party requests with local models |
+
+```bash
+cd frontend
+npm test                    # includes the phishing model checks and TC-04
+npm run test:toxicity       # TC-05 against the real transformer (downloads it once)
+npm run fetch-models        # optional: serve toxic-bert + ONNX runtime from this server
+npm run train:phishing      # retrain the phishing model (downloads the dataset once)
+```
+
+---
+
+## 7. Performance and Scalability (Objective 5, report Table 5.2)
+
+### 7.1 Cost of each operation
+
+`npm run bench -- --toxicity` runs the same modules the browser runs. Node 22,
+Intel Xeon 2.1 GHz, median of 200 runs:
+
+| Operation | Algorithm | Median |
+|---|---|---|
+| Key pair generation | ML-KEM-768 | 0.48 ms |
+| Encapsulation | ML-KEM-768 | 0.55 ms |
+| Decapsulation | ML-KEM-768 | 0.66 ms |
+| Encrypt a message (2 recipients) | ML-KEM ×2 + HKDF + AES-256-GCM | 1.66 ms |
+| Decrypt a message | ML-KEM + HKDF + AES-256-GCM | 1.18 ms |
+| Merkle leaf for one message | SHA-256 | 0.12 ms |
+| Merkle root over 1,000 messages | SHA-256 tree | 52.9 ms |
+| Verify an inclusion proof (n = 1,000) | 10 hashes | 0.48 ms |
+| Phishing classification | TensorFlow.js | 0.54 ms |
+| Hate-speech classification | toxic-bert, ONNX int8 | 10.5 ms |
+
+Post-quantum security costs about **1.7 ms** per message — far below what a person can
+perceive. The browser's protocol console logs the live per-message figures.
+
+### 7.2 Load test
+
+`backend/scripts/loadtest.js` creates throw-away accounts, opens one authenticated
+Socket.io connection per user, pairs them, and has each user send 20 messages at
+2 per second. Payloads are sized like real ML-KEM-768 v2 envelopes (~3.3 KB), so the
+server does its real work — validate, store in MongoDB, relay. Latency is end to end,
+sender's emit to recipient's receipt. Single Node.js process, MongoDB and the load
+generator all on one 2-vCPU cloud machine:
+
+| Concurrent users | Messages | Delivered | Throughput | p50 | p95 | p99 | Errors |
+|---|---|---|---|---|---|---|---|
+| 50 | 1,000 | 1,000 | 94/s | 3.4 ms | 8.7 ms | 15.9 ms | 0 |
+| 100 | 2,000 | 2,000 | 189/s | 2.5 ms | 6.0 ms | 13.4 ms | 0 |
+| 250 | 5,000 | 5,000 | 472/s | 3.7 ms | 17.5 ms | 58 ms | 0 |
+| 500 | 10,000 | 10,000 | 943/s | 129 ms | 501 ms | 533 ms | 0 |
+
+Up to **250 concurrent users** the server delivers every message with a median under
+4 ms — no measurable degradation. At 500 users nothing is lost, but latency rises to
+a few hundred milliseconds: one Node.js process (sharing the CPU with the 500 simulated
+clients) is saturated. The next step is horizontal: several server processes behind a
+load balancer with the Socket.io Redis adapter, which the stateless JWT design already
+allows.
+
+```bash
+cd backend && npm run dev              # in one terminal
+node scripts/loadtest.js --users 250   # in another
+```
+
+---
+
+## 8. Messaging Features (Attachments, Replies, Reactions, Delete, Presence)
 
 Beyond text, QChat's chat surface supports the messaging primitives users expect from a modern app — all still routed through the same end-to-end encryption pipeline as plain text:
 
@@ -628,9 +786,9 @@ chats is discarded rather than landing in the wrong conversation.
 > a multi-megabyte attachment still lands inside the document. Tracked in
 > `improve.txt` → `OPS-4`.
 
-## 7. Identity, Contacts & Access Control
+## 9. Identity, Contacts & Access Control
 
-### 7.1 Authenticated Transport
+### 9.1 Authenticated Transport
 Both layers authenticate independently. REST routes verify a bearer JWT; the
 Socket.io layer verifies the same token **during the handshake** and every event
 derives its actor from `socket.user`, never from the event payload:
@@ -650,7 +808,7 @@ let any client send messages as another user, delete their messages, or register
 with a victim's id and drain their queued offline messages. Each socket joins a
 room named after its user id, so presence and delivery work across multiple tabs.
 
-### 7.2 Contact Discovery by QChat ID
+### 9.2 Contact Discovery by QChat ID
 Every account gets a shareable id such as `QC-8L99-2TVY`, drawn from a
 Crockford-style alphabet that omits `0`, `O`, `1` and `I` so a code read aloud or
 copied by hand cannot land on the wrong account.
@@ -664,36 +822,106 @@ or to check whether a given username exists.
 
 ---
 
-## 8. System Architecture, Modules and Requirements
+## 10. System Architecture, Modules and Requirements
 
 This section maps the architecture described in Chapter 3 of the report onto the files
 that actually implement it.
 
-### 8.1 Architecture layers
+### 10.0 Diagrams (report Fig. 3.1 and Appendix C)
+
+The sources and PNG renders (for the report) are in [`docs/diagrams/`](docs/diagrams/).
+
+**System architecture** — five layers; everything in the top box runs in the browser.
+
+```mermaid
+flowchart TB
+  subgraph Browser["Client device (browser)"]
+    UI["Client Layer<br/>React UI: chat, files, voice notes, video"]
+    AI["AI Layer (Web Worker)<br/>TF.js phishing model · toxic-bert"]
+    SEC["Security Layer<br/>ML-KEM-768 · HKDF-SHA256 · AES-256-GCM"]
+    INT["Integrity Layer<br/>RFC 6962 Merkle tree · IndexedDB checkpoints"]
+    COM["Communication Layer<br/>Socket.io client · WebRTC + per-frame sealing"]
+    UI --> AI
+    UI --> SEC
+    SEC --> COM
+    INT --- UI
+  end
+  subgraph Server["Node.js server (sees ciphertext only)"]
+    API["Express REST<br/>JWT · bcrypt · rate limits"]
+    WS["Socket.io relay<br/>messages · presence · call signals"]
+    LEAF["Merkle leaf service"]
+  end
+  DB[("MongoDB<br/>users · public keys · ciphertext")]
+  COM -- "HTTPS / WSS" --> API
+  COM -- "WSS" --> WS
+  COM <-. "WebRTC P2P media, PQ-sealed frames" .-> PEER["Peer's browser"]
+  API --> DB
+  WS --> DB
+  LEAF --> DB
+  INT -- "leaves + proofs" --> LEAF
+```
+
+**Sending a message** (report §4.1)
+
+```mermaid
+sequenceDiagram
+  participant A as Alice's browser
+  participant S as Server
+  participant B as Bob's browser
+  A->>A: AI shield checks the draft (stops it if flagged)
+  A->>A: Random content key K, AES-256-GCM(text)
+  A->>A: ML-KEM encapsulate to Bob and to Alice, HKDF wraps K for each
+  A->>S: send_message {ciphertext, wrapped keys}
+  S->>S: Validate, store, compute Merkle leaf
+  S-->>A: message_sent (ack)
+  S->>B: new_message
+  B->>B: Decapsulate with private key, unwrap K, AES-GCM decrypt
+  B->>B: Merkle tree re-verified against this device's checkpoint
+  B->>B: AI shield checks the plaintext (banner / blur if flagged)
+```
+
+**Starting a post-quantum video call** (report §4.2)
+
+```mermaid
+sequenceDiagram
+  participant A as Caller
+  participant S as Server (relay)
+  participant B as Callee
+  A->>A: Random 32-byte media secret
+  A->>S: call offer: SDP + media secret, sealed to the callee (ML-KEM-768 + AES-GCM)
+  S->>B: relay sealed offer (server cannot open it)
+  B->>B: Decapsulate, recover the media secret
+  B->>S: sealed answer
+  S->>A: relay sealed answer
+  A-->>B: sealed ICE candidates, then direct WebRTC
+  Note over A,B: HKDF derives one AES-256-GCM key per direction.<br/>Every encoded audio/video frame is sealed, on top of DTLS-SRTP
+```
+
+### 10.1 Architecture layers
 
 | Layer (report §3.1) | Responsibility | Where it lives | Status |
 |---|---|---|---|
 | **Client Layer** | User interface: messaging, file sharing, video, displaying decrypted content | `frontend/src/components/` — `ChatDashboard.jsx`, `Landing.jsx`, `Login.jsx`, `Register.jsx` | Implemented |
 | **Security Layer** | ML-KEM key exchange, AES-256 symmetric encryption/decryption | `frontend/src/crypto/encryption.js` | Implemented |
 | **Integrity Layer** | Hash-linked chat history, tamper detection | `merkle.js`, `useTranscriptTree.js`, `utils/merkleLeaf.js` | Met — RFC 6962 Merkle tree with inclusion proofs |
-| **AI Layer** | On-device phishing analysis | — | **Not implemented** |
+| **AI Layer** | On-device phishing and hate-speech analysis | `frontend/src/ai/` — `threat.worker.js`, `phishing.js`, `phishingFeatures.js`, `toxicity.js`, `threatShield.js` | Implemented (§6) |
 | **Communication Layer** | WebRTC peer-to-peer transport, PQ-protected signaling | `ChatDashboard.jsx`, `crypto/mediaTransport.js`, `crypto/mediaCrypto.js`, `backend/server.js` | Implemented, media included |
 
 All cryptographic work happens client-side. The Node.js server relays and stores
 ciphertext; it never receives a message key or plaintext.
 
-### 8.2 System modules
+### 10.2 System modules
 
 | Module (report §3.1.1) | Implementation | Status |
 |---|---|---|
-| **Authentication Module** | bcrypt password hashing, JWT issuance, JWT-verified REST middleware **and** Socket.io handshake auth | Implemented (§7.1) |
+| **Authentication Module** | bcrypt password hashing, JWT issuance, JWT-verified REST middleware **and** Socket.io handshake auth | Implemented (§9.1) |
 | **Hybrid Encryption Module** | `encryptForRecipients` / `decryptEnvelope` — ML-KEM-768 + AES-256-GCM, HKDF-SHA256 key derivation | Implemented (§2.5) |
-| **Messaging Module** | Text, images, voice notes, files; replies, reactions, delete-for-everyone, read receipts, presence, paged history | Implemented (§6) |
+| **Messaging Module** | Text, images, voice notes, files; replies, reactions, delete-for-everyone, read receipts, presence, paged history | Implemented (§8) |
 | **Video Calling Module** | WebRTC peer-to-peer audio/video, encrypted signaling, PQ-sealed media frames | Implemented (§5) |
 | **Integrity Module** | Merkle tree over every message, per-device checkpoints, inclusion proofs, peer root comparison | Implemented (§4) |
-| **Phishing Detection Module** | — | **Not implemented** |
+| **Phishing Detection Module** | TensorFlow.js phishing classifier + Transformers.js toxic-bert in a Web Worker; outgoing check before encryption, incoming warnings | Implemented (§6) |
 
-### 8.3 Functional requirements (report §3.2.1)
+### 10.3 Functional requirements (report §3.2.1)
 
 | Requirement | Status | Note |
 |---|---|---|
@@ -701,24 +929,24 @@ ciphertext; it never receives a message key or plaintext.
 | Message encryption using AES-256 | Met | AES-256-GCM, 12-byte IV, 16-byte authentication tag |
 | End-to-end decryption at receiver only | Met | Private key never leaves the device in plaintext; the server stores only a password-encrypted backup it cannot open |
 | Integrity verification using Merkle Tree | Met | RFC 6962 tree; modification, removal and back-dating are detected and named; O(log n) inclusion proofs |
-| AI-based phishing detection | **Not met** | No model present |
+| AI-based phishing detection | Met | On-device, before encryption; 0.838 F1 / 4.3% false alarms as deployed; TC-04 and TC-05 pass |
 | Secure real-time communication (WebRTC) | Met | Signaling and media both PQ-protected |
 | Authentication and access control | Met | JWT on REST and sockets; every socket event derives its actor from the verified token |
 
-### 8.4 Non-functional requirements (report §3.2.2)
+### 10.4 Non-functional requirements (report §3.2.2)
 
 | Requirement | Status | Honest note |
 |---|---|---|
 | Resistance to classical and quantum attacks | Largely met | Message and media confidentiality rest on ML-KEM. Passwords use bcrypt; TLS to the server is still classical, which is normal and out of scope. |
-| Low latency communication | Met in practice | Socket.io transport with WebRTC peer-to-peer media. Not formally measured. |
+| Low latency communication | Met, measured | 1.7 ms of cryptography per message; 2.5–3.7 ms median server delivery up to 250 users (§7). |
 | Privacy preservation | Met with one caveat | All crypto is client-side. The caveat: the server receives the password at sign-in to check it against the bcrypt hash — see §3.1. |
-| Scalability | **Unverified** | The architecture supports it; no load test has been run (`improve.txt → OPS-1`). Do not claim a concurrent-user figure. |
+| Scalability | Met up to 250 concurrent users on one process | Load-tested (§7.2): no loss and no measurable degradation to 250 users; at 500, still no loss but p95 latency ≈ 0.5 s. Beyond that needs more processes (Socket.io Redis adapter), which the stateless design permits. |
 | Reliability and fault tolerance | Partial | Socket reconnection with backoff, offline message queue with delivery on reconnect, queued ICE candidates. No clustering or failover. |
 | User-friendly interface | Met | Responsive React UI, landing page, toast notifications, keyboard-operable contact list. |
 
 ---
 
-## 9. Threat Model — what this does and does not protect
+## 11. Threat Model — what this does and does not protect
 
 Stating this plainly matters more than any feature list.
 
@@ -746,27 +974,28 @@ Stating this plainly matters more than any feature list.
 | **A malicious server — forged senders** | ML-KEM gives confidentiality, not sender authentication. Public keys are public, so the server can encrypt a message (or a call offer) to you and label it as coming from any contact. Signing every payload with **ML-DSA** (FIPS 204, also in `@noble/post-quantum`) would close this; it is not implemented. |
 | **XSS or a compromised browser** | The private key lives in `localStorage` and is readable by any injected script. Known injection paths are closed (attachment URLs above), but this remains an architectural tradeoff of browser-based E2EE. |
 | **Metadata analysis** | The server necessarily knows who talks to whom, when, message sizes and timing. Content is blind; the social graph is not. |
-| **Phishing and social engineering** | Objective 3 was to address this on-device. It is not implemented. |
+| **Phishing and social engineering — fully** | The on-device shield (§6) warns about typical lures and look-alike links, but it is a classifier: it misses about a quarter of phishing messages and cannot judge a convincing message with no link or tell-tale wording. It warns; it does not guarantee. |
 | **A malicious peer** | Anyone you talk to can screenshot, copy or retain plaintext. E2EE protects transport and storage, not the endpoint. |
 | **Endpoint compromise** | If the device is owned, the key is owned. |
 | **Forward secrecy** | Each message uses a fresh encapsulation, but the long-term ML-KEM key is static. Compromising it exposes past messages. Ratcheting (Signal-style) would fix this and is not implemented. |
 
 ---
 
-## 10. Setup & Installation
+## 12. Setup & Installation
 
-### 10.0 Technology Stack
+### 12.0 Technology Stack
 - **Frontend**: React 18 (Vite), Tailwind CSS, Framer Motion, Socket.io-client, `@noble/post-quantum`
+- **On-device AI**: TensorFlow.js 4.22 (phishing classifier), Transformers.js 2.17 (`Xenova/toxic-bert`, ONNX Runtime WebAssembly), in a Web Worker
 - **Backend**: Node.js, Express, Socket.io, MongoDB (Mongoose)
 - **Cryptography**: ML-KEM-768 (FIPS 203), AES-256-GCM, HKDF-SHA256, PBKDF2-SHA256, SHA-256
 - **Real-time media**: WebRTC peer-to-peer video; signaling ML-KEM sealed, media frames sealed per-frame (§5.1)
 - **Security middleware**: JWT on REST *and* Socket.io, bcrypt, helmet, express-rate-limit
 - **Messaging**: image/audio/file attachments, voice notes, reply threading, encrypted reactions, delete-for-everyone, presence, cursor-paged history
 
-### 10.1 Prerequisites
+### 12.1 Prerequisites
 - Node.js v20 or higher
 
-### 10.2 Clone & Install
+### 12.2 Clone & Install
 ```bash
 # Backend
 cd backend
@@ -777,7 +1006,7 @@ cd ../frontend
 npm install
 ```
 
-### 10.3 Configure Environment
+### 12.3 Configure Environment
 Copy `backend/.env.example` to `backend/.env` and fill it in:
 ```
 PORT=5000
@@ -794,13 +1023,16 @@ The frontend needs no configuration for local dev (an empty `VITE_API_URL` route
 `/api` through the Vite proxy). For a deployment, or to enable TURN, copy
 `frontend/.env.example` to `frontend/.env.local`.
 
-### 10.4 Tests
+### 12.4 Tests
 ```bash
-cd frontend && npm test   # Merkle tree: CT test vectors, RFC 6962 reference, every proof up to 64 leaves
-cd backend  && npm test   # server and browser compute byte-identical leaves
+cd frontend && npm test               # Merkle tree vectors and proofs; phishing model, TC-04
+cd frontend && npm run test:toxicity  # TC-05 with the real hate-speech model (downloads ~110 MB once)
+cd frontend && npm run bench          # Table 5.2 timings (add -- --toxicity for the transformer)
+cd backend  && npm test               # server and browser compute byte-identical leaves
+cd backend  && node scripts/loadtest.js --users 250   # load test, backend must be running
 ```
 
-### 10.5 Run Development Servers
+### 12.5 Run Development Servers
 ```bash
 # Terminal 1: Backend
 cd backend
@@ -811,10 +1043,15 @@ cd frontend
 npm run dev
 ```
 
+The phishing model ships in the repository. The hate-speech model is fetched from the
+Hugging Face hub the first time the chat opens and then cached by the browser; to serve
+it from your own machine instead (offline demos, or zero third-party requests), run
+`npm run fetch-models` in `frontend/` once.
+
 
 ---
 
-## 11. Current Limitations and Future Scope
+## 13. Current Limitations and Future Scope
 
 Every engineering project ships with a known boundary. This section states Q-Chat's, so the
 implementation and the report can be read against each other without ambiguity — and so the
@@ -823,13 +1060,14 @@ next phase has a concrete starting point.
 | Report claim | Reality | Tracked as |
 |---|---|---|
 | "SHA-256 based Merkle hash chain… detection of unauthorized modification" (Abstract) | Met. An RFC 6962 Merkle tree over every message, with per-device checkpoints, named findings, inclusion proofs and peer comparison (§4). | — |
-| "On-device AI-based phishing detection module using TensorFlow.js" (Abstract) | Phase II. The AI Layer is reserved in the architecture; no model is trained or loaded yet. | `FEAT-2` |
-| "Extensive testing demonstrates… effectively detects phishing attempts" (Abstract) | Reword before final submission — the detection module is Phase II scope. | `FEAT-2` |
-| "Scalability: handles multiple concurrent users without performance degradation" (§3.2.2) | Architecturally plausible, never measured. No load test exists. | `OPS-1` |
+| "On-device AI-based phishing detection module using TensorFlow.js" (Abstract) | Met. TensorFlow.js phishing model plus Transformers.js hate-speech model, both in a Web Worker (§6). | — |
+| "Extensive testing demonstrates… effectively detects phishing attempts" (Abstract) | Supported, with numbers: 86.5% accuracy, 93.8% precision, 75.7% recall on 7,402 held-out samples (§6.2). Quote these rather than "effectively". | — |
+| "Scalability: handles multiple concurrent users without performance degradation" (§3.2.2) | Measured: true up to 250 concurrent users on one process; degradation begins by 500 (§7.2). | — |
 | "Signaling is protected using post-quantum cryptographic techniques" (§3.1) | Met, and **exceeded** — media frames are PQ-sealed too, which the report only lists as an objective (§1.2 obj. 4). | — |
-| Repository contents: "System architecture diagrams, flowcharts, and supporting images" (Appendix C) | Figures 3.1 and 4.1 exist in the report but are not in the repository. | — |
+| Repository contents: "System architecture diagrams, flowcharts, and supporting images" (Appendix C) | Met. The architecture diagram and the message, call and AI flowcharts are in this README as Mermaid (§6.1, §10.0), rendered by GitHub. | — |
 | Appendix C repository link | Points at `Project-Title-Q-Chat-…`. The repo has since been renamed to `QChat-A-Post-Quantum-Secure-Messaging-Platform`; GitHub redirects, so the printed link still resolves. | — |
-| Slide deck tech stack names **Redis** and **Docker** | Neither is a dependency of this project. | — |
+| Slide deck tech stack names **Redis**, **Docker** and **Material UI** | None is a dependency of this project (the UI is Tailwind CSS). Redis would be the next step for multi-process scaling (§7.2). | — |
+| Report text describes a "Merkle hash chain" | The code now implements a full RFC 6962 Merkle tree, which is stronger. Update the wording. | — |
 | Sender authenticity (implied by "secure messaging") | Content is confidential, but nothing proves who sent it against a hostile server. ML-DSA signatures are the planned fix. | — |
 
 **Verified working:** post-quantum call media has been confirmed in a live two-party
@@ -840,7 +1078,7 @@ spoofed hang-up / chat-lock during calls, sealed and negotiated-fallback media, 
 reactions, tie-safe paging, uniform login errors and logout cleanup. The Firefox/Safari
 code path is implemented but has not been exercised.
 
-The Merkle tree has a committed test suite (§10.4): the Certificate Transparency
+The Merkle tree has a committed test suite (§12.4): the Certificate Transparency
 reference vectors, agreement with a literal RFC 6962 implementation for 0–100 leaves,
 every inclusion proof for every tree up to 64 leaves, rejection of altered proofs, the
 CVE-2012-2459 case, and byte-identical leaves between server and browser. The tamper
@@ -850,7 +1088,7 @@ is still to do.
 
 ---
 
-## 12. Repository Layout
+## 14. Repository Layout
 
 ```
 backend/
@@ -861,8 +1099,10 @@ backend/
   routes/              auth.js · messages.js · users.js
   utils/               qchatId.js · validation.js · logger.js · serialize.js · merkleLeaf.js · attacks.js
   routes/demo.js       attack simulator, only when DEMO_MODE=true
-  scripts/             delete-user.js · tamper.js (Merkle demo)
+  scripts/             delete-user.js · tamper.js (Merkle demo) · loadtest.js
   test/                merkleLeaf.test.js
+frontend/public/models/phishing/   trained model (model.json, weights.bin, meta.json with test metrics)
+frontend/scripts/      train-phishing.mjs · fetch-models.mjs · bench.mjs
 frontend/src/
   components/          ChatDashboard · Landing · Login · Register · visuals/
   crypto/
@@ -872,10 +1112,18 @@ frontend/src/
     mediaCrypto.js         Per-frame cipher for call media
     mediaTransport.js      Binds the frame cipher to an RTCPeerConnection
     mediaTransform.worker.js  Firefox/Safari encoded-transform path
+  ai/
+    threat.worker.js       Web Worker hosting both models
+    threatShield.js        Main-thread API: start, analyse, status, verdict text
+    phishing.js            Phishing model loader, decision policy, analyse
+    phishingFeatures.js    Feature extraction shared by training and the browser
+    toxicity.js            toxic-bert loader and per-label thresholds
+    *.test.js, fixtures.json
   hooks/useTranscriptTree.js  Builds, verifies and checkpoints the open chat's tree
   components/TranscriptPanel.jsx  Header badge, integrity panel, proof dialog
   lib/api.js           axios instance with auth + 401 handling
   lib/checkpointStore.js  IndexedDB store for per-device tree checkpoints
+docs/diagrams/         Architecture and flow diagrams — Mermaid sources + PNG renders
 CLAUDE.md              Full codebase index — file map, crypto contracts, gotchas
 improve.txt            Live backlog (gitignored)
 ```

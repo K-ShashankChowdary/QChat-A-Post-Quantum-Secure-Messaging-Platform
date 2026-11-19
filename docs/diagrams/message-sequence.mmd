@@ -1,0 +1,14 @@
+sequenceDiagram
+  participant A as Alice's browser
+  participant S as Server
+  participant B as Bob's browser
+  A->>A: AI shield checks the draft (stops it if flagged)
+  A->>A: Random content key K, AES-256-GCM(text)
+  A->>A: ML-KEM encapsulate to Bob and to Alice, HKDF wraps K for each
+  A->>S: send_message {ciphertext, wrapped keys}
+  S->>S: Validate, store, compute Merkle leaf
+  S-->>A: message_sent (ack)
+  S->>B: new_message
+  B->>B: Decapsulate with private key, unwrap K, AES-GCM decrypt
+  B->>B: Merkle tree re-verified against this device's checkpoint
+  B->>B: AI shield checks the plaintext (banner / blur if flagged)
