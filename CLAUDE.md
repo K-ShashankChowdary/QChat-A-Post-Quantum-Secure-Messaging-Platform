@@ -43,7 +43,9 @@ README's phrasing imply otherwise.
 | `utils/logger.js` (48) | Structured console logger with contexts. |
 | `utils/serialize.js` | `serializeMessage` — the one wire shape for a message (relay, offline delivery, history). |
 | `utils/merkleLeaf.js` | Server-side Merkle leaf; mirrors `frontend/src/crypto/merkle.js`. |
-| `scripts/tamper.js` | Merkle demo: alter a message's time/payload or remove it, directly in Mongo. |
+| `scripts/tamper.js` | Merkle demo from a terminal: `list`, then `time` / `payload` / `remove` / `insert`. |
+| `utils/attacks.js` | The four attacks + undo records; shared by `tamper.js` and `routes/demo.js`. |
+| `routes/demo.js` | In-app attack simulator. 404 unless `DEMO_MODE=true`, refused in production; participants only; undo via `/restore`; emits `transcript_refresh` to both sides. |
 | `test/merkleLeaf.test.js` | `npm test` — server and browser leaves must be identical. |
 | `scripts/delete-user.js` (49) | Deletes an account + its messages + contact refs. |
 
@@ -179,6 +181,11 @@ order = (timestamp, id)                       empty root = SHA-256("")
   hasn't received the newest message isn't a false mismatch.
 - **Why the timestamp is in the leaf:** AES-GCM doesn't cover it. `scripts/tamper.js <id>
   time` proves it — the message still opens, and only the tree flags it.
+- **Demo mode** (`DEMO_MODE=true`): the panel grows an Attack simulator. An attack emits
+  `transcript_refresh` to both participants → `refreshConversation` = `transcript.suspend()`,
+  `loadHistory(peer, { replace: true })`, `transcript.reload()`. Suspending matters: judging
+  new server leaves against old messages (or checkpointing a half-updated view) gave wrong
+  verdicts. A newly tampered status auto-opens the panel.
 - Limits: proves no rewrite *after* a device verified; says nothing about authorship
   (ML-DSA gap); checkpoints are per browser.
 

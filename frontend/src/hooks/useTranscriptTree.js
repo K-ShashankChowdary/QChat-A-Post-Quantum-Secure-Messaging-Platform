@@ -37,6 +37,10 @@ export function useTranscriptTree({ myId, peerId, messages }) {
   const [reloadKey, setReloadKey] = useState(0);
   const leafCache   = useRef(new Map());
   const verdictFor  = useRef(null);
+  // While the caller is swapping in a freshly fetched history, no verdict is
+  // reached and nothing is checkpointed — otherwise a half-updated view (new
+  // server leaves, old messages) could be judged, or worse, saved.
+  const suspended   = useRef(false);
   const key = myId && peerId ? checkpointKey(myId, peerId) : null;
 
   // 1. The server's leaves, per conversation.
@@ -94,7 +98,7 @@ export function useTranscriptTree({ myId, peerId, messages }) {
     return () => { cancelled = true; };
     // messagesKey is the distillation of `messages` that a leaf depends on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messagesKey]);
+  }, [messagesKey, reloadKey]);
 
   // The server's list, with every leaf this device computed itself taking its
   // place — what the tree commits to is what this device actually received.
@@ -128,7 +132,7 @@ export function useTranscriptTree({ myId, peerId, messages }) {
 
   // 3. Once per opened conversation: against the last checkpoint.
   useEffect(() => {
-    if (!entries || !key || server.error || verdictFor.current === peerId) return;
+    if (!entries || !key || server.error || suspended.current || verdictFor.current === peerId) return;
     verdictFor.current = peerId;
     (async () => {
       const checkpoint = await loadCheckpoint(key);
@@ -151,7 +155,7 @@ export function useTranscriptTree({ myId, peerId, messages }) {
   }, [key, entries, tree]);
 
   useEffect(() => {
-    if (!verdict || verdict.peerId !== peerId || verdict.status === 'tampered' || mismatches.length) return undefined;
+    if (suspended.current || !verdict || verdict.peerId !== peerId || verdict.status === 'tampered' || mismatches.length) return undefined;
     const t = setTimeout(persist, 600);
     return () => clearTimeout(t);
   }, [persist, verdict, mismatches, peerId]);
@@ -162,11 +166,31 @@ export function useTranscriptTree({ myId, peerId, messages }) {
     setVerdict(v => (v ? { ...v, status: 'ok', findings: [], accepted: true } : v));
   }, [persist]);
 
+  /** Stop judging until reload(): call before replacing the loaded history. */
+  const suspend = useCallback(() => {
+    suspended.current = true;
+    verdictFor.current = null;
+    setVerdict(null);
+  }, []);
+
+  /** Re-fetch every leaf and re-verify against the checkpoint, which is kept. */
+  const reload = useCallback(() => {
+    suspended.current = false;
+    setReloadKey(k => k + 1);
+  }, []);
+
   /** Forget this conversation's checkpoint — used when the chat is cleared. */
   const reset = useCallback(async () => {
     if (key) await clearCheckpoint(key);
+    suspended.current = false;
     setReloadKey(k => k + 1);
   }, [key]);
+
+  /** A message's position in the tree (0-based), or -1. */
+  const indexOf = useCallback(
+    (id) => (entries ? entries.findIndex(e => e.id === String(id)) : -1),
+    [entries],
+  );
 
   const proofFor = useCallback(async (id) => {
     if (!tree || !entries || tree.size !== entries.length) return null;
@@ -201,6 +225,9 @@ export function useTranscriptTree({ myId, peerId, messages }) {
     ready,
     acceptCurrent,
     reset,
+    suspend,
+    reload,
+    indexOf,
     proofFor,
     rootAt,
   };

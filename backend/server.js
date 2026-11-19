@@ -10,6 +10,7 @@ import { connectDB, backfillQChatIds, backfillLeaves, User, Message } from './db
 import authRoutes from './routes/auth.js';
 import messageRoutes from './routes/messages.js';
 import userRoutes from './routes/users.js';
+import demoRoutes from './routes/demo.js';
 import { authenticateSocket } from './middleware/auth.js';
 import { logger } from './utils/logger.js';
 import { isValidObjectId, approximateSize } from './utils/validation.js';
@@ -121,6 +122,7 @@ app.use('/api/auth',         authLimiter, authRoutes);
 app.use('/api/messages',     messageRoutes);
 app.use('/api/users/lookup', lookupLimiter);
 app.use('/api/users',        userRoutes);
+app.use('/api/demo',         demoRoutes);
 
 // ── Socket.io ──
 
@@ -415,6 +417,9 @@ app.use((err, req, res, _next) => {
 
 httpServer.listen(config.port, () => {
   logger.info(`QChat backend running`, { port: config.port, env: config.nodeEnv, cors: config.corsOrigin }, 'Server');
+  if (config.demoMode) {
+    logger.warn('DEMO MODE — the attack simulator is enabled. Never run this way for real users.', null, 'Server');
+  }
 });
 
 // Close sockets and the database cleanly on Ctrl-C or a container stop, so

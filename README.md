@@ -429,24 +429,48 @@ shown the two of them different conversations.
 
 #### 4.4 Demonstrating it
 
-1. Start the app and exchange a few messages between two accounts. Open the chat on both
-   devices — that saves each device's checkpoint.
-2. In a terminal (MongoDB running, `backend/.env` in place):
+**One-click, in the app (recommended for a presentation).**
+
+1. In `backend/.env` set `DEMO_MODE=true` and restart the backend. The log says
+   `DEMO MODE — the attack simulator is enabled`. (It is ignored when `NODE_ENV=production`.)
+2. Sign in as two users on two screens (or a normal and an incognito window) and exchange a
+   few messages. Opening the chat on each device saves its checkpoint.
+3. Click the green **Tree verified** badge in the chat header. The panel shows the Merkle
+   root; in demo mode it also has an **Attack simulator**.
+4. Pick a target message and an attack:
+
+   | Attack | What it does to the database | What the audience sees |
+   |---|---|---|
+   | **Rewrite its timestamp** | moves the message 10 minutes later | the message still decrypts — and the tree still names it. Encryption alone cannot catch this. |
+   | **Corrupt one byte** | flips a bit of the ciphertext | AES-GCM refuses to open it, and the tree names it |
+   | **Delete it** | removes the row | the message is gone, and the tree says which one |
+   | **Replay into the past** | inserts a copy a minute earlier | a perfectly decryptable duplicate, flagged as back-dated |
+
+   The server recomputes the stored hash too, as a careful attacker would, then tells **both**
+   devices to re-verify. Both screens turn red, *History changed*, and the panel opens by
+   itself naming the message (e.g. "Message #2 was changed after this device verified it").
+   **Show** scrolls to it.
+5. Hover any message and click its shield icon (**Verify**) to show its inclusion proof —
+   one message proven with ⌈log₂ n⌉ hashes — and use **Compare with peer** to show both
+   devices agree on the root.
+6. **Restore database** undoes every attack, and both screens go green again — ready to
+   repeat.
+
+*Suggested 60-second script:* "Every message is a leaf of a Merkle tree; this is the root.
+My device remembers it. Now I'll act as a malicious server and change only the time this
+message was sent — the encryption doesn't cover that, so the message still opens… but the
+tree catches it, on both phones, and tells us exactly which message. Restore — and it's
+verified again."
+
+**From a terminal**, the same attacks without demo mode:
 
 ```bash
 cd backend
 node scripts/tamper.js list <userA> <userB>    # the conversation, numbered in tree order, with ids
-node scripts/tamper.js <messageId> time        # shift that message's timestamp by 10 minutes
-node scripts/tamper.js <messageId> payload     # or: flip one byte of its ciphertext
-node scripts/tamper.js <messageId> remove      # or: delete the row
+node scripts/tamper.js <messageId> time        # or: payload | remove | insert
 ```
 
-3. Reload the chat.
-
-The script recomputes the server's leaf afterwards, as a careful attacker would. After a
-reload the header turns red, *History changed*, and the panel names the message by the same
-number `list` printed: e.g. "Message #2 was changed after this device verified it" — while that message still decrypts
-and reads normally, because only its timestamp moved.
+Reload the chat afterwards. (The terminal route has no undo.)
 
 > **Scope:** the tree proves history was not rewritten *after* a device verified it. It
 > does not prove who wrote a message (that needs signatures — see §9), and a checkpoint is
@@ -835,7 +859,8 @@ backend/
   db/database.js       User and Message schemas, index definitions
   middleware/auth.js   REST token check + Socket.io handshake auth
   routes/              auth.js · messages.js · users.js
-  utils/               qchatId.js · validation.js · logger.js · serialize.js · merkleLeaf.js
+  utils/               qchatId.js · validation.js · logger.js · serialize.js · merkleLeaf.js · attacks.js
+  routes/demo.js       attack simulator, only when DEMO_MODE=true
   scripts/             delete-user.js · tamper.js (Merkle demo)
   test/                merkleLeaf.test.js
 frontend/src/

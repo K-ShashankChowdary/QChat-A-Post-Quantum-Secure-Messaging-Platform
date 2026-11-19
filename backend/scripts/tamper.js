@@ -6,6 +6,9 @@
  *   node scripts/tamper.js <messageId> time       shift its timestamp by 10 minutes
  *   node scripts/tamper.js <messageId> payload    flip one byte of its ciphertext
  *   node scripts/tamper.js <messageId> remove     delete the message row
+ *   node scripts/tamper.js <messageId> insert     replay a copy of it a minute earlier
+ *
+ * The same attacks are one click away in the app when DEMO_MODE=true.
  *
  * The leaf is recomputed afterwards, as a careful attacker would, so the
  * server's own leaf list stays self-consistent. Detection comes from the
@@ -20,16 +23,16 @@
  */
 import mongoose from 'mongoose';
 import { connectDB, Message, User } from '../db/database.js';
-import { leafForMessage } from '../utils/merkleLeaf.js';
+import { ATTACKS, applyAttack } from '../utils/attacks.js';
 
-const MODES = ['time', 'payload', 'remove'];
+const MODES = Object.keys(ATTACKS);
 const args = process.argv.slice(2);
 
 function usage(problem) {
   if (problem) console.error(`${problem}\n`);
   console.error('Usage:');
   console.error('  node scripts/tamper.js list <userA> <userB>');
-  console.error('  node scripts/tamper.js <messageId> [time|payload|remove]');
+  console.error('  node scripts/tamper.js <messageId> [time|payload|remove|insert]');
   process.exit(1);
 }
 
@@ -57,26 +60,12 @@ async function list(nameA, nameB) {
 async function tamper(id, mode) {
   const msg = await Message.findById(id);
   if (!msg) usage('No message with that id.');
-
-  if (mode === 'remove') {
-    await msg.deleteOne();
-    console.log(`Removed message ${id}.`);
-    return;
+  try {
+    await applyAttack(msg, mode);
+  } catch (err) {
+    usage(err.message);
   }
-  if (mode === 'time') {
-    msg.timestamp = new Date(msg.timestamp.getTime() + 10 * 60 * 1000);
-  } else {
-    const payload = structuredClone(msg.payload);
-    const bytes = Buffer.from(payload?.ciphertext || '', 'base64');
-    if (bytes.length === 0) usage('That message has no ciphertext to alter (is it deleted?).');
-    bytes[0] ^= 0x01;
-    payload.ciphertext = bytes.toString('base64');
-    msg.payload = payload;
-    msg.markModified('payload');
-  }
-  msg.leaf = leafForMessage(msg);
-  await msg.save();
-  console.log(`Tampered with message ${id} (${mode}); its leaf was recomputed to stay self-consistent.`);
+  console.log(`${ATTACKS[mode]} — done for message ${id}. Its leaf was recomputed to stay self-consistent.`);
   console.log('Reload the chat on a device that had opened it before — the header will name the message.');
 }
 

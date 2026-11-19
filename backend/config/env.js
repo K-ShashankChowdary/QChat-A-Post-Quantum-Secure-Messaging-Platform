@@ -36,6 +36,10 @@ export const config = {
   // connection for anything but tiny attachments. Keep the transport ceiling and
   // the enforced per-message ceiling in sync (see improve.txt OPS-4).
   maxMessageBytes: parseInt(process.env.MAX_MESSAGE_BYTES, 10) || 12 * 1024 * 1024,
+  // The in-app attack simulator (routes/demo.js). For presentations only:
+  // it lets a signed-in user tamper with their own conversations in the
+  // database, so it is refused outright in production.
+  demoMode: process.env.DEMO_MODE === 'true' && (process.env.NODE_ENV || 'development') !== 'production',
 };
 
 export default config;

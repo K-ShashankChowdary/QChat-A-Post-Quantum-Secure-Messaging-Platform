@@ -2,7 +2,7 @@ import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ShieldCheck, ShieldAlert, ShieldQuestion, Loader2, X, GitCompare, CheckCircle2,
-  XCircle, ArrowUp, CornerDownRight,
+  XCircle, ArrowUp, CornerDownRight, Zap, RotateCcw,
 } from 'lucide-react';
 
 /* ─── Presentation for the transcript Merkle tree ───
@@ -93,8 +93,78 @@ function Modal({ open, onClose, children, label }) {
 }
 
 /** Whole-conversation view: root, verdict, findings, compare with the peer. */
+const ATTACK_HINTS = {
+  time:    'Still decrypts — only the tree notices',
+  payload: 'AES-GCM rejects it; the tree names it',
+  remove:  'A message silently vanishes',
+  insert:  'A real message, replayed into the past',
+};
+
+/** Demo mode only: one-click attacks on the server's own copy of this chat. */
+function AttackSimulator({ demo }) {
+  const [target, setTarget] = React.useState('');
+  const targets = demo.targets;
+  React.useEffect(() => {
+    if (!targets.some(t => t.id === target)) setTarget(targets[targets.length - 1]?.id || '');
+  }, [targets, target]);
+
+  return (
+    <div className="mt-5 rounded-xl border border-amber-400/25 bg-amber-400/[0.04] p-3.5">
+      <div className="flex items-center gap-2 mb-1">
+        <Zap size={13} className="text-amber-300" />
+        <h3 className="text-[13px] font-bold text-amber-100">Attack simulator</h3>
+        <span className="text-[9px] font-bold uppercase tracking-widest text-amber-300/80 border border-amber-400/30 rounded px-1.5 py-0.5">Demo mode</span>
+      </div>
+      <p className="text-[11px] text-slate-400 leading-relaxed mb-3">
+        Each attack is applied to the server's database the way a malicious operator would — the
+        stored hash is recomputed too, so the server's own records stay consistent. Both devices
+        then re-verify. <span className="text-slate-300">Restore</span> undoes everything.
+      </p>
+
+      {targets.length === 0 ? (
+        <p className="text-xs text-slate-500">Send a few messages first.</p>
+      ) : (
+        <>
+          <label className="block text-[10px] uppercase tracking-widest text-slate-500 mb-1" htmlFor="attack-target">Target message</label>
+          <select
+            id="attack-target"
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            className="w-full bg-navy-900 border border-white/10 rounded-lg text-xs text-slate-200 px-2.5 py-2 mb-3"
+          >
+            {targets.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+          </select>
+          <div className="grid grid-cols-2 gap-2">
+            {Object.entries(demo.attacks).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                disabled={demo.busy || !target}
+                onClick={() => demo.onAttack(mode, target)}
+                className="text-left rounded-lg border border-rose-400/25 bg-rose-500/[0.07] hover:bg-rose-500/[0.14] disabled:opacity-50 px-3 py-2 transition-colors"
+              >
+                <span className="block text-xs font-semibold text-rose-200">{label}</span>
+                <span className="block text-[10px] text-slate-400 mt-0.5">{ATTACK_HINTS[mode]}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      <button
+        type="button"
+        onClick={demo.onRestore}
+        disabled={demo.busy}
+        className="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-300 hover:text-emerald-200 disabled:opacity-50"
+      >
+        <RotateCcw size={12} /> Restore database
+      </button>
+    </div>
+  );
+}
+
 export function TranscriptPanel({
-  open, onClose, tree, peerName, onCompare, compare, onAccept, onJump,
+  open, onClose, tree, peerName, onCompare, compare, onAccept, onJump, demo,
 }) {
   const { status, root, size, findings, appended, checkpointAt } = tree;
   const meta = STATUS[status] || STATUS.checking;
@@ -182,6 +252,8 @@ export function TranscriptPanel({
           </span>
         </div>
       )}
+
+      {demo && <AttackSimulator demo={demo} />}
 
       <p className="text-[11px] text-slate-500 leading-relaxed mt-5 border-t border-white/[0.06] pt-3">
         Each message is a leaf, hashed from its sender, id, time and ciphertext; pairs of hashes

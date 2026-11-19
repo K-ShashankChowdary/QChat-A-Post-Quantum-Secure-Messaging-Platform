@@ -198,6 +198,10 @@ export default function ChatDashboard() {
   const compareWaitRef                  = useRef(null);
   const lastCompareFromRef              = useRef(new Map());   // peer id -> time of their last request
   const transcriptRef                   = useRef(null);
+  // Demo mode (server DEMO_MODE=true): the attack simulator in the panel.
+  const [demo, setDemo]                 = useState(null);
+  const [attackBusy, setAttackBusy]     = useState(false);
+  const refreshRef                      = useRef(null);
   const [connStatus, setConnStatus]     = useState('connecting');
   
   // WhatsApp Features State
@@ -964,6 +968,12 @@ export default function ChatDashboard() {
       handleTranscriptCheck(fromId, payload);
     });
 
+    // The server changed this conversation's stored history (the demo attack
+    // simulator, or its restore): reload it and verify again.
+    s.on('transcript_refresh', ({ peerId }) => {
+      if (String(peerRef.current?.id) === String(peerId)) refreshRef.current?.(peerId);
+    });
+
     fetchUsers();
     return () => {
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
@@ -1025,6 +1035,63 @@ export default function ChatDashboard() {
     messages,
   });
   useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
+
+  /* Re-fetch the open conversation and verify it again from scratch. The tree
+     is suspended first so it never judges new leaves against old messages. */
+  const refreshConversation = async (peerId) => {
+    transcript.suspend();
+    await loadHistory(peerId, { replace: true });
+    transcript.reload();
+  };
+  useEffect(() => { refreshRef.current = refreshConversation; });
+
+  // A tampered history opens the integrity panel on its own: a warning that
+  // waits for someone to click a small badge is easy to miss.
+  const lastStatusRef = useRef(null);
+  useEffect(() => {
+    if (transcript.status === 'tampered' && lastStatusRef.current !== 'tampered') setShowTranscript(true);
+    if (transcript.status && transcript.status !== 'checking') lastStatusRef.current = transcript.status;
+  }, [transcript.status]);
+
+  useEffect(() => {
+    api.get('/api/demo').then(({ data }) => setDemo(data?.enabled ? data : null)).catch(() => setDemo(null));
+  }, []);
+
+  const runAttack = async (mode, messageId) => {
+    setAttackBusy(true);
+    try {
+      // The server tells both devices to re-verify (transcript_refresh).
+      await api.post('/api/demo/tamper', { messageId, mode });
+      addLog(`Simulated attack on message ${String(messageId).slice(-6)}: ${demo?.attacks?.[mode] || mode}`, 'pink');
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'The attack could not be run.');
+    } finally {
+      setAttackBusy(false);
+    }
+  };
+
+  const restoreAttacks = async () => {
+    if (!peer) return;
+    setAttackBusy(true);
+    try {
+      const { data } = await api.post('/api/demo/restore', { peerId: peer.id });
+      toast.success(data.restored ? `Restored the database — ${data.restored} attack${data.restored === 1 ? '' : 's'} undone.` : 'Nothing to restore.');
+    } catch (err) {
+      toast.error(err.response?.data?.error || 'Could not restore.');
+    } finally {
+      setAttackBusy(false);
+    }
+  };
+
+  const attackTargets = useMemo(() => messages
+    .filter(m => isRealId(m.id) && !m.deleted && !m.sendFailed)
+    .slice(-12)
+    .map(m => {
+      const n = transcript.indexOf(m.id);
+      const who = m.isMine ? 'You' : (peer?.username || 'Them');
+      const text = m.error ? '(undecryptable)' : previewText(m);
+      return { id: String(m.id), label: `${n >= 0 ? `#${n + 1}` : '#?'} · ${who}: ${text.length > 40 ? `${text.slice(0, 40)}…` : text}` };
+    }), [messages, transcript.indexOf, peer?.username]);
 
   /** Ask the peer's device for its root over the same messages, and compare. */
   const compareWithPeer = async () => {
@@ -1188,7 +1255,7 @@ export default function ChatDashboard() {
     };
   }));
 
-  const loadHistory = async (peerId) => {
+  const loadHistory = async (peerId, { replace = false } = {}) => {
     try {
       const unreadIds = [];
       const { data } = await api.get(`/api/messages/${peerId}?limit=${PAGE_SIZE}&_t=${Date.now()}`);
@@ -1199,9 +1266,11 @@ export default function ChatDashboard() {
       if (String(peerRef.current?.id) !== String(peerId)) return;
       // Merge rather than replace: a live message that arrived during the fetch
       // is already on screen and may not be in this page.
+      // With `replace`, the fetched page is the truth — anything the server no
+      // longer returns is dropped, apart from sends still in flight.
       setMessages(prev => {
         const known = new Set(history.map(m => String(m.id)));
-        return [...history, ...prev.filter(m => !known.has(String(m.id)))];
+        return [...history, ...prev.filter(m => !known.has(String(m.id)) && (!replace || !isRealId(m.id)))];
       });
       if (data.length) {
         const opened = history.filter(m => !m.error).length;
@@ -2483,6 +2552,13 @@ export default function ChatDashboard() {
           compare={compare}
           onAccept={async () => { await transcript.acceptCurrent(); toast.success('Current history accepted as the new checkpoint.'); }}
           onJump={jumpToMessage}
+          demo={demo ? {
+            attacks: demo.attacks,
+            targets: attackTargets,
+            onAttack: runAttack,
+            onRestore: restoreAttacks,
+            busy: attackBusy,
+          } : null}
         />
       )}
       <ProofDialog
