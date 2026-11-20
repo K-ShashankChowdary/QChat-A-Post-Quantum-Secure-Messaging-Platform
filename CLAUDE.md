@@ -544,6 +544,10 @@ renumbered to 8–14.
   reference + key material in the payload would roughly halve storage and bandwidth.
 - ~~**FEAT-2** — on-device AI phishing detection.~~ Done (Nov 2026): `frontend/src/ai/`, README §6.
 - ~~**FEAT-3** — true branching Merkle tree.~~ Done (Nov 2026): RFC 6962 tree, checkpoints, proofs, peer compare.
+- **(unticketed)** dependency advisories left after Nov 2026 `npm audit fix`: all need a major
+  upgrade. `@xenova/transformers` v2 (protobufjs/onnxruntime-web/sharp; only trusted model files
+  are parsed, sharp is Node-only) → move to `@huggingface/transformers` v3. `vite` 5 dev-server
+  issues (dev only) → vite 6+. `react-router-dom` 6 → 7. Backend: `minimatch` via nodemon (dev only).
 - **(unticketed)** ML-DSA signatures on every payload — closes the forged-sender gap.
 - **(unticketed)** commit the e2e suite as a real regression test.
 
