@@ -498,6 +498,16 @@ renumbered to 8–14.
 
 ## 11. Gotchas that already cost real time
 
+- **A worker's async loop does not see new messages between jobs** unless it yields a real
+  task (`setTimeout(0)`): ONNX/TF.js inference resolves through microtasks only. The AI
+  worker's priority queue did nothing until `pump()` yielded — the user's draft sat behind a
+  42-message history scan, timed out at 1.5 s and was sent unchecked.
+- **Scan timeouts must not mark a message as scanned.** A 4 s timeout on history scans
+  silently skipped everything late in a long backlog; incoming scans now wait 120 s and
+  un-mark on timeout.
+- **Bound regexes and model inputs against hostile text.** `URL_RE`'s unbounded
+  `(\.label)*` took 5 s on `"a.".repeat(50000)`; toxic-bert at 512 tokens took ~5 s in
+  browser WASM. Now: ≤ 9 labels, 4,000 chars for phishing, 600 chars / 128 tokens for toxicity.
 - **Vite does not re-read `tailwind.config.js`** without a restart. Never `@apply` a
   config-defined utility; declare custom animations as plain CSS with their own `@keyframes`.
 - **A `const` shadowing a function parameter** inside the same block puts every earlier read

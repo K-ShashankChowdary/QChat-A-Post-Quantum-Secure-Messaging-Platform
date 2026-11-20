@@ -122,7 +122,13 @@ export function fnv1a(str) {
   return h >>> 0;
 }
 
-const URL_RE = /\b(?:(?:https?:\/\/|www\.)[^\s<>"'()]+|[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,24}(?:\/[^\s<>"'()]*)?)/gi;
+// The bare-domain branch caps the number of labels: an unbounded `(\.label)*`
+// backtracks quadratically on text like "a.a.a.a…", which froze the worker
+// for seconds on a 100 KB message.
+const URL_RE = /\b(?:(?:https?:\/\/|www\.)[^\s<>"'()]+|[a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9-]{1,63}){0,8}\.[a-z]{2,24}(?:\/[^\s<>"'()]*)?)/gi;
+// Analysis looks at the start of a message only. Lures put the hook up front,
+// and it bounds the work a hostile sender can force onto the recipient.
+export const MAX_TEXT = 4000;
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
 const SECOND_LEVEL = new Set(['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'nic']);
 const DELEET = { 0: 'o', 1: 'l', 3: 'e', 4: 'a', 5: 's', 7: 't', 8: 'b' };
@@ -130,7 +136,7 @@ const DELEET = { 0: 'o', 1: 'l', 3: 'e', 4: 'a', 5: 's', 7: 't', 8: 'b' };
 /** Pull URLs out of free text and split each into host and the rest. */
 export function extractUrls(text) {
   const found = [];
-  for (const match of String(text).matchAll(URL_RE)) {
+  for (const match of String(text).slice(0, MAX_TEXT).matchAll(URL_RE)) {
     let raw = match[0].replace(/[.,;:!?)\]]+$/, '');
     // "e.g." or "3.5" style false positives: no letters in the last label.
     const scheme = /^https?:\/\//i.test(raw);
@@ -176,7 +182,7 @@ const countHits = (text, list) => list.reduce((n, w) => n + (text.includes(w) ? 
 
 /** Every hand-built indicator for a message, as numbers in [0, 1], plus details for explanations. */
 export function computeSignals(text) {
-  const raw = String(text || '');
+  const raw = String(text || '').slice(0, MAX_TEXT);
   const lower = raw.toLowerCase();
   const urls = extractUrls(raw);
   const letters = raw.replace(/[^a-z]/gi, '');
@@ -232,7 +238,7 @@ function logNormalise(vec, offset, dim) {
 /** Text → the model's input vector, plus the signal details used to explain a verdict. */
 export function featurize(text) {
   const vec = new Float32Array(FEATURE_DIM);
-  const lower = String(text || '').toLowerCase().slice(0, 4000);
+  const lower = String(text || '').slice(0, MAX_TEXT).toLowerCase();
 
   const words = tokens(lower);
   for (let i = 0; i < words.length; i++) {

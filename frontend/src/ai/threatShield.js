@@ -59,15 +59,16 @@ export const shieldStatus = () => status;
 /**
  * Analyse one message. Resolves to { phishing, toxicity, ms } — either part is
  * null while its model is still loading — or null after `timeoutMs`, so a slow
- * model can never hold a message up for long.
+ * model can never hold a message up for long. `priority` puts it at the front
+ * of the worker's queue (the user's own draft, ahead of history scans).
  */
-export function analyzeMessage(text, timeoutMs = 4000) {
+export function analyzeMessage(text, timeoutMs = 4000, { priority = false } = {}) {
   if (!worker || !text || !String(text).trim()) return Promise.resolve(null);
   const id = ++seq;
   return new Promise((resolve) => {
     const timer = setTimeout(() => { pending.delete(id); resolve(null); }, timeoutMs);
     pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
-    worker.postMessage({ type: 'analyze', id, text: String(text) });
+    worker.postMessage({ type: 'analyze', id, text: String(text), priority });
   });
 }
 

@@ -27,6 +27,13 @@ const PRIORITY = ['identity_hate', 'threat', 'severe_toxic', 'insult', 'obscene'
 
 let classifier = null;
 
+// BERT reads up to 512 tokens, but in browser WebAssembly a full-length input
+// takes seconds — long enough for a pasted wall of text to stall the queue and
+// make the user's own draft check time out. Abuse shows in the first lines;
+// 128 tokens (~90 words) keeps the worst case well under a second.
+const MAX_TOKENS = 128;
+const MAX_CHARS = 600;
+
 /**
  * Configure where model files come from. With `local`, everything (weights and
  * the ONNX Runtime WebAssembly) is served by QChat itself from public/models/,
@@ -49,6 +56,7 @@ export async function loadToxicityModel(onProgress) {
     quantized: true,
     progress_callback: onProgress,
   });
+  classifier.tokenizer.model_max_length = MAX_TOKENS;
   return classifier;
 }
 
@@ -69,7 +77,7 @@ export function judgeToxicity(scores) {
 export async function analyzeToxicity(text) {
   if (!classifier) throw new Error('TOXICITY_MODEL_NOT_LOADED');
   const t0 = performance.now();
-  const out = await classifier(String(text).slice(0, 1000), { topk: null });
+  const out = await classifier(String(text).slice(0, MAX_CHARS), { topk: null });
   const scores = Object.fromEntries(out.map(r => [r.label, +r.score.toFixed(4)]));
   return { ...judgeToxicity(scores), scores, ms: +(performance.now() - t0).toFixed(1) };
 }

@@ -5,7 +5,7 @@
  *
  * Protocol (postMessage):
  *   page → worker  { type: 'init', base }
- *                  { type: 'analyze', id, text }
+ *                  { type: 'analyze', id, text, priority? }
  *   worker → page  { type: 'status', phishing, toxicity, progress, local, error? }
  *                  { type: 'result', id, phishing, toxicity, ms }
  *
@@ -67,8 +67,36 @@ async function analyze(id, text) {
   post(result);
 }
 
+// One inference at a time, and the sender's own draft goes first. Opening a
+// chat queues its whole history for scanning; without priority a draft would
+// wait behind all of it, time out, and be sent unchecked.
+//
+// The yield matters: inference resolves through microtasks only, so without a
+// real task boundary between jobs no new `message` event is delivered until
+// the whole backlog is done, and the draft can never jump the queue.
+const queue = [];
+let busy = false;
+const nextTask = () => new Promise(resolve => setTimeout(resolve, 0));
+async function pump() {
+  if (busy) return;
+  busy = true;
+  try {
+    while (queue.length) {
+      await nextTask();
+      const job = queue.shift();
+      if (job) await analyze(job.id, job.text);
+    }
+  } finally {
+    busy = false;
+  }
+}
+
 self.onmessage = (e) => {
   const msg = e.data || {};
   if (msg.type === 'init') init(msg.base || '/models');
-  else if (msg.type === 'analyze') analyze(msg.id, msg.text);
+  else if (msg.type === 'analyze') {
+    const job = { id: msg.id, text: msg.text };
+    if (msg.priority) queue.unshift(job); else queue.push(job);
+    pump();
+  }
 };

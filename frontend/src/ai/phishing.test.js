@@ -89,3 +89,13 @@ test('TC-04 (report Table 5.1): a deceptive URL with credential harvesting is fl
   assert.ok(r.reasons.length >= 2, JSON.stringify(r.reasons));
   assert.ok(r.ms < 50, `inference took ${r.ms} ms`);
 });
+
+test('hostile input cannot stall feature extraction (no quadratic regex backtracking)', () => {
+  for (const text of ['a.'.repeat(50_000), 'ab-'.repeat(30_000), `http://${'a-'.repeat(30_000)}.com`, 'x'.repeat(200_000)]) {
+    const t0 = performance.now();
+    featurize(text);
+    assert.ok(performance.now() - t0 < 250, `took ${(performance.now() - t0).toFixed(0)} ms on ${text.slice(0, 12)}…`);
+  }
+  // Long but ordinary hosts are still found.
+  assert.deepEqual(extractUrls('see a.b.c.d.e.f.g.example.com now').map(u => u.host), ['a.b.c.d.e.f.g.example.com']);
+});

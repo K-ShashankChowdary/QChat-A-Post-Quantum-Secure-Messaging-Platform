@@ -200,6 +200,7 @@ export default function ChatDashboard() {
   const [threats, setThreats]           = useState({});
   const [revealed, setRevealed]         = useState({});
   const scannedRef                      = useRef(new Map());   // id -> { phishing, toxicity } models applied
+  const shieldOnRef                     = useRef(shieldOn);    // read by scans that finish after a toggle
 
   // Transcript Merkle tree UI: the integrity panel, a peer comparison in
   // flight, and the proof dialog for one message.
@@ -1105,8 +1106,15 @@ export default function ChatDashboard() {
     }), [messages, transcript.indexOf, peer?.username]);
 
   /* ─── AI shield ─── */
+  // A blurred message must not reappear in clear in a reply quote.
+  const shieldedPreview = (m) => {
+    const t = m && !m.isMine && threats[m.id];
+    if (t && t.parts.some(p => p.kind === 'toxicity') && !revealed[m.id]) return 'Message hidden by the AI shield';
+    return previewText(m);
+  };
+
   useEffect(() => onShieldStatus(setShield), []);
-  useEffect(() => { if (shieldOn) startShield(); }, [shieldOn]);
+  useEffect(() => { shieldOnRef.current = shieldOn; if (shieldOn) startShield(); }, [shieldOn]);
 
   const toggleShield = () => {
     const next = !shieldOn;
@@ -1129,13 +1137,18 @@ export default function ChatDashboard() {
       const done = scannedRef.current.get(m.id);
       if (done && (done.phishing || !phishingReady) && (done.toxicity || !toxicityReady)) continue;
       scannedRef.current.set(m.id, { phishing: phishingReady, toxicity: toxicityReady });
-      analyzeMessage(m.text).then((result) => {
-        if (!result) return;
+      // History is scanned in the background, so allow it time: a short
+      // timeout here used to mark queued messages as scanned when their
+      // result simply hadn't come back yet, and they were never flagged.
+      analyzeMessage(m.text, 120_000).then((result) => {
+        if (!shieldOnRef.current) return;
+        if (!result) { scannedRef.current.delete(m.id); return; }
         const parts = describeThreat(result);
         if (parts) {
           setThreats(prev => ({ ...prev, [m.id]: { parts, result } }));
           addLog(`AI shield flagged a message on-device: ${parts.map(p => p.title).join(' + ')} · ${result.ms} ms`, 'pink');
-        } else {
+        } else if (Date.now() - new Date(m.timestamp).getTime() < 60_000) {
+          // Only live messages; a whole history page of "clean" lines buried the console.
           addLog(`AI shield: message clean · phishing ${result.phishing ? result.phishing.score : '—'} · toxicity ${result.toxicity ? result.toxicity.scores.toxic : '—'} · ${result.ms} ms on-device`, 'cyan');
         }
       });
@@ -1494,8 +1507,11 @@ export default function ChatDashboard() {
     // message hostage to a model that is still loading.
     if (shieldOn && msgType === 'text') {
       setEncrypting(true);
-      const verdict = await analyzeMessage(textToSend, 1500);
+      const verdict = await analyzeMessage(textToSend, 1500, { priority: true });
       setEncrypting(false);
+      if (!verdict && (shield.phishing === 'ready' || shield.toxicity === 'ready')) {
+        addLog('AI shield check took over 1.5 s — sent without it', 'pink');
+      }
       const parts = describeThreat(verdict);
       if (parts) {
         addLog(`AI shield flagged your draft on-device: ${parts.map(p => p.title).join(' + ')} · ${verdict.ms} ms`, 'pink');
@@ -1821,7 +1837,7 @@ export default function ChatDashboard() {
                  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                }}>
             <span className="font-semibold text-emerald-400 block mb-0.5">Reply</span>
-            <p className="truncate w-40 text-slate-300">{previewText(messages.find(m => String(m.id) === String(msg.replyToId)))}</p>
+            <p className="truncate w-40 text-slate-300">{shieldedPreview(messages.find(m => String(m.id) === String(msg.replyToId)))}</p>
           </div>
         )}
         {content}
@@ -2597,7 +2613,7 @@ export default function ChatDashboard() {
                 <div className="mb-2 flex items-center justify-between bg-black/40 p-2 rounded-lg border-l-4 border-emerald-400">
                   <div className="flex flex-col overflow-hidden">
                     <span className="text-xs font-semibold text-emerald-400">Replying to {replyingTo.isMine ? 'yourself' : peer.username}</span>
-                    <span className="text-xs text-slate-300 truncate">{previewText(replyingTo)}</span>
+                    <span className="text-xs text-slate-300 truncate">{shieldedPreview(replyingTo)}</span>
                   </div>
                   <button onClick={() => setReplyingTo(null)} className="text-slate-400 hover:text-white"><X size={14}/></button>
                 </div>
